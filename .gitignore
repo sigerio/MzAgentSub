@@ -1,0 +1,9 @@
+.env
+.mz_agent/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+src/mz_agent.egg-info/
