@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -269,7 +270,13 @@ def _prepare_snapshot_for_round(
     draft_answer: str,
 ) -> ContextSnapshot:
     perception = dict(snapshot.perception)
-    perception["pending_user_message"] = goal
+    perception.update(
+        _build_perception_payload(
+            goal=goal,
+            action_type=action_type,
+            target=target,
+        )
+    )
 
     pending_action_arguments = _build_pending_action_arguments(
         action_type=action_type,
@@ -287,6 +294,38 @@ def _prepare_snapshot_for_round(
     return snapshot.model_copy(update=update)
 
 
+def _build_perception_payload(
+    *,
+    goal: str,
+    action_type: str,
+    target: str | None,
+) -> dict[str, object]:
+    normalized_goal = _normalize_goal(goal=goal)
+    constraints = _extract_constraints(goal=normalized_goal)
+    intent_summary = _extract_intent_summary(
+        goal=normalized_goal,
+        constraints=constraints,
+    )
+    clarify_needed, clarify_reason = _judge_clarify_needed(
+        normalized_goal=normalized_goal,
+        action_type=action_type,
+        target=target,
+        intent_summary=intent_summary,
+    )
+    perception: dict[str, object] = {
+        "pending_user_message": goal,
+        "normalized_goal": normalized_goal,
+        "intent_summary": intent_summary,
+        "constraints": constraints,
+        "clarify_needed": clarify_needed,
+    }
+    if clarify_reason is not None:
+        perception["clarify_reason"] = clarify_reason
+    else:
+        perception.pop("clarify_reason", None)
+    return perception
+
+
 def _build_pending_action_arguments(
     *,
     action_type: str,
@@ -300,6 +339,56 @@ def _build_pending_action_arguments(
     if action_type in {"tool", "mcp"}:
         return {}
     return None
+
+
+def _normalize_goal(*, goal: str) -> str:
+    return " ".join(goal.strip().split())
+
+
+def _extract_constraints(*, goal: str) -> list[str]:
+    if not goal:
+        return []
+    segments = [
+        segment.strip()
+        for segment in re.split(r"[，,。；;\n]+", goal)
+        if segment.strip()
+    ]
+    return [
+        segment
+        for segment in segments
+        if any(keyword in segment for keyword in ("只", "必须", "不要", "不能", "限定", "仅"))
+    ]
+
+
+def _extract_intent_summary(*, goal: str, constraints: list[str]) -> str:
+    if not goal:
+        return ""
+    segments = [
+        segment.strip()
+        for segment in re.split(r"[，,。；;\n]+", goal)
+        if segment.strip()
+    ]
+    intent_segments = [segment for segment in segments if segment not in constraints]
+    if not intent_segments:
+        return goal
+    return "；".join(intent_segments)
+
+
+def _judge_clarify_needed(
+    *,
+    normalized_goal: str,
+    action_type: str,
+    target: str | None,
+    intent_summary: str,
+) -> tuple[bool, str | None]:
+    if not normalized_goal:
+        return (True, "目标为空。")
+    if action_type in {"tool", "mcp", "skill", "rag"} and not target:
+        return (True, "缺少动作目标。")
+    vague_goals = {"处理一下", "看一下", "搞一下", "弄一下", "帮我处理一下", "帮我看一下"}
+    if normalized_goal in vague_goals and not intent_summary:
+        return (True, "缺少明确意图。")
+    return (False, None)
 
 
 def _build_request_identifiers(

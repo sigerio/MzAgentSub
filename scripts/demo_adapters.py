@@ -20,6 +20,7 @@ from mz_agent.adapters.rag import RAGAdapter  # noqa: E402
 from mz_agent.adapters.skill import SkillAdapter, SkillDescriptor  # noqa: E402
 from mz_agent.adapters.tool import ToolAdapter  # noqa: E402
 from mz_agent.contracts.context import ExecutionContext  # noqa: E402
+from mz_agent.knowledge import KnowledgeBase  # noqa: E402
 from mz_agent.contracts.llm import LLMMessage, LLMRequest  # noqa: E402
 from mz_agent.contracts.tooling import (  # noqa: E402
     MCPBinding,
@@ -129,10 +130,14 @@ def main() -> None:
             execution_context=execution_context,
         ).model_dump(mode="json")
     elif args.adapter == "rag":
-        adapter = RAGAdapter(
-            knowledge_chunks=[{"text": "协议冻结总表", "score": 0.9}],
-            top_k=1,
+        knowledge_base = KnowledgeBase()
+        knowledge_base.ingest_text(
+            document_id="protocol",
+            title="protocol",
+            source_path="memory://protocol",
+            content="协议冻结总表\n\n协议状态机与字段约束已经冻结。",
         )
+        adapter = RAGAdapter(knowledge_base=knowledge_base, top_k=1)
         payload = adapter.retrieve(query="协议", execution_context=execution_context)
     else:
         adapter = SkillAdapter()

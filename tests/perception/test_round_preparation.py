@@ -12,6 +12,10 @@ def test_prepare_snapshot_for_tool_round_records_pending_message_and_query() -> 
     )
 
     assert snapshot.perception["pending_user_message"] == "搜索协议"
+    assert snapshot.perception["normalized_goal"] == "搜索协议"
+    assert snapshot.perception["intent_summary"] == "搜索协议"
+    assert snapshot.perception["constraints"] == []
+    assert snapshot.perception["clarify_needed"] is False
     assert snapshot.perception["pending_action_arguments"] == {"query": "搜索协议"}
     assert snapshot.last_observation is None
 
@@ -65,3 +69,31 @@ def test_build_pending_action_arguments_only_exposes_frozen_bridges() -> None:
         target=None,
         goal="协议",
     ) is None
+
+
+def test_prepare_snapshot_extracts_constraints_without_overwriting_intent() -> None:
+    snapshot = _prepare_snapshot_for_round(
+        snapshot=ContextSnapshot(current_plan=None),
+        goal="搜索协议，只输出 JSON，不要解释",
+        action_type="tool",
+        target="search_docs",
+        draft_answer="任务已收束",
+    )
+
+    assert snapshot.perception["intent_summary"] == "搜索协议"
+    assert snapshot.perception["constraints"] == ["只输出 JSON", "不要解释"]
+    assert snapshot.perception["clarify_needed"] is False
+
+
+def test_prepare_snapshot_marks_clarify_when_target_missing_for_tool() -> None:
+    snapshot = _prepare_snapshot_for_round(
+        snapshot=ContextSnapshot(current_plan=None),
+        goal="帮我处理一下",
+        action_type="tool",
+        target=None,
+        draft_answer="任务已收束",
+    )
+
+    assert snapshot.perception["clarify_needed"] is True
+    assert snapshot.perception["clarify_reason"] == "缺少动作目标。"
+    assert snapshot.perception["pending_action_arguments"] == {}

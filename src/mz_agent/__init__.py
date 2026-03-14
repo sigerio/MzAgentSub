@@ -3,6 +3,7 @@
 __all__ = [
     "adapters",
     "contracts",
+    "knowledge",
     "orchestration",
     "runtime",
 ]
