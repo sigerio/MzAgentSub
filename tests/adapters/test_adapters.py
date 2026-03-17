@@ -106,4 +106,4 @@ def test_llm_adapter_returns_normalized_payload() -> None:
     )
 
     assert llm_result.provider_trace is not None
-    assert llm_result.provider_trace.provider == "openai"
+    assert llm_result.provider_trace.provider in {"openai_native", "openai_compatible_proxy"}

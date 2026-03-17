@@ -39,6 +39,7 @@ class ProviderTrace(BaseModel):
     provider: str
     model: str
     api_mode: str
+    profile_name: str | None = None
     stream: bool
     attempt: int = Field(default=1, ge=1)
 
@@ -48,6 +49,7 @@ class LLMRequest(BaseModel):
 
     messages: list[LLMMessage]
     model_policy: str
+    profile_name: str | None = None
     route_hint: str | None = None
     tool_schemas: list[DynamicObject] = Field(default_factory=list)
     response_schema: DynamicObject | None = None
@@ -65,4 +67,3 @@ class LLMResponse(BaseModel):
     finish_reason: str
     latency_ms: int = Field(default=0, ge=0)
     raw_response_meta: DynamicObject = Field(default_factory=dict)
-

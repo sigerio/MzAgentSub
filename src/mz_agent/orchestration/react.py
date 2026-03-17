@@ -142,12 +142,17 @@ class ReActEngine:
                 context_snapshot=context_snapshot,
                 goal=goal,
             )
+            llm_action_input = _build_action_arguments(
+                context_snapshot=context_snapshot,
+                goal=goal,
+                action_type="llm",
+                target=None,
+            )
+            llm_action_input["messages"] = messages
             return NextAction(
                 action_type="llm",
                 action_target=None,
-                action_input={
-                    "messages": messages
-                },
+                action_input=llm_action_input,
             )
 
         if action.action_type == "clarify":
@@ -221,6 +226,18 @@ def _build_action_arguments(
     target: str | None,
 ) -> dict[str, object]:
     perception = context_snapshot.perception
+    available_arguments = perception.get("available_action_arguments")
+    if isinstance(available_arguments, dict):
+        action_arguments = available_arguments.get(action_type)
+        if isinstance(action_arguments, dict):
+            if target is not None:
+                target_arguments = action_arguments.get(target)
+                if isinstance(target_arguments, dict):
+                    return dict(target_arguments)
+            default_arguments = action_arguments.get("__default__")
+            if isinstance(default_arguments, dict):
+                return dict(default_arguments)
+
     pending_arguments = perception.get("pending_action_arguments")
     if isinstance(pending_arguments, dict):
         return dict(pending_arguments)

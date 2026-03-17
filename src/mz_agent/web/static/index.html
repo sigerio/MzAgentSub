@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MzAgent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body data-session-id="__SESSION_ID__">
+
+    <!-- 移动端侧边栏遮罩 -->
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <div class="app-shell">
+
+      <!-- ===== 侧边栏 ===== -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div class="sidebar-brand">
+            <div class="brand-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            </div>
+            <span class="brand-name">MzAgent</span>
+          </div>
+          <button class="btn-new-chat" id="btn-new-chat" type="button" aria-label="新建对话">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+          </button>
+        </div>
+
+        <div class="session-list" id="session-list">
+          <div class="session-list-label">当前会话</div>
+          <div class="session-item active">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+            <span class="session-item-text" id="sidebar-session-label">__SESSION_ID__</span>
+          </div>
+          <!-- 预留：多会话列表由 JS 动态渲染 -->
+        </div>
+
+        <!-- 能力管理菜单 -->
+        <div class="sidebar-nav" id="sidebar-nav">
+          <div class="session-list-label">能力管理</div>
+          <button class="sidebar-nav-btn" id="btn-open-tools" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
+            <span>TOOLS</span>
+            <span class="nav-badge" id="tools-badge">0</span>
+          </button>
+          <button class="sidebar-nav-btn" id="btn-open-mcp" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <span>MCP</span>
+            <span class="nav-badge" id="mcp-badge">0</span>
+          </button>
+          <button class="sidebar-nav-btn" id="btn-open-skills" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            <span>SKILLS</span>
+            <span class="nav-badge" id="skills-badge">0</span>
+          </button>
+        </div>
+
+        <div class="sidebar-footer">
+          <button class="sidebar-footer-btn" id="btn-open-settings" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            <span>连接设置</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- ===== 主区域 ===== -->
+      <div class="main-area">
+
+        <!-- 顶栏 -->
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="btn-sidebar-toggle" id="btn-sidebar-toggle" type="button" aria-label="切换侧边栏">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><path d="M3 6h18"/><path d="M3 18h18"/></svg>
+            </button>
+            <select class="topbar-model-select" id="profile-selector" aria-label="选择连接方案">
+              <!-- 由 JS 动态填充 -->
+            </select>
+            <span class="status-dot" id="status-dot" title="待输入"></span>
+            <span class="session-id-label" id="session-id">__SESSION_ID__</span>
+          </div>
+          <div class="topbar-right">
+            <button class="topbar-btn" id="refresh-status" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+              刷新
+            </button>
+            <button class="topbar-btn" id="copy-session" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+              复制会话
+            </button>
+            <button class="topbar-btn danger" id="reset-session" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+              重置
+            </button>
+          </div>
+        </header>
+
+        <!-- 对话流 -->
+        <div class="chat-scroll" id="chat-scroll">
+          <div class="chat-flow" id="chat-flow">
+            <!-- 空态 -->
+            <div class="chat-empty" id="chat-empty">
+              <div class="chat-empty-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+              </div>
+              <h2 class="chat-empty-title">MzAgent 控制台</h2>
+              <p class="chat-empty-subtitle">输入你的任务，选择处理方式，开始与 Agent 协作。</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 处理中指示（默认隐藏） -->
+        <div class="thinking-indicator hidden" id="thinking-indicator">
+          <div class="message-avatar" style="background:var(--accent);color:#fff;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M12 2L2 7l10 5 10-5-10-5z"/></svg>
+          </div>
+          <div class="thinking-dots"><span></span><span></span><span></span></div>
+        </div>
+
+        <!-- 输入区 -->
+        <div class="composer">
+          <div class="composer-inner">
+            <form id="round-form" autocomplete="off">
+              <div class="composer-box">
+                <textarea
+                  class="composer-textarea"
+                  id="goal"
+                  name="goal"
+                  rows="1"
+                  placeholder="你想让我做什么..."
+                  aria-label="任务描述"
+                ></textarea>
+                <div class="composer-bottom">
+                  <div class="composer-toggles" id="capability-toggles">
+                    <label class="rag-switch" title="检索增强生成">
+                      <input type="checkbox" id="rag-toggle" />
+                      <span class="rag-switch-slider"></span>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                      <span class="rag-switch-label">RAG</span>
+                    </label>
+                  </div>
+                  <button class="btn-send" id="submit-button" type="submit" aria-label="发送">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                  </button>
+                </div>
+              </div>
+              <p class="composer-error" id="goal-error" aria-live="polite"></p>
+            </form>
+          </div>
+        </div>
+
+      </div><!-- /.main-area -->
+    </div><!-- /.app-shell -->
+
+    <!-- ===== 设置抽屉 ===== -->
+    <div class="settings-overlay" id="settings-overlay"></div>
+    <div class="settings-drawer" id="settings-drawer" role="dialog" aria-label="连接设置">
+      <div class="settings-drawer-header">
+        <span class="settings-drawer-title">连接设置</span>
+        <button class="btn-close-drawer" id="btn-close-settings" type="button" aria-label="关闭设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="settings-drawer-body">
+        <form id="profile-form" autocomplete="off">
+          <div class="settings-group-label">方案选择</div>
+          <div class="settings-field">
+            <label for="profile-selector-drawer">当前方案</label>
+            <select id="profile-selector-drawer" name="profile_selector_drawer"></select>
+          </div>
+
+          <div class="settings-group-label">方案配置</div>
+          <div class="settings-field">
+            <label for="profile-name">方案名</label>
+            <input id="profile-name" name="profile_name" type="text" placeholder="例如：Claude 反代" />
+          </div>
+          <div class="settings-field">
+            <label for="profile-provider-type">类型</label>
+            <select id="profile-provider-type" name="provider_type">
+              <option value="openai_native">原生 OpenAI</option>
+              <option value="openai_compatible_proxy">反代兼容接口</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label for="profile-model">默认模型</label>
+            <input id="profile-model" name="default_model" type="text" placeholder="例如：gpt-4o-mini" />
+          </div>
+          <div class="settings-field">
+            <label for="profile-api-mode">接口模式</label>
+            <select id="profile-api-mode" name="api_mode">
+              <option value="responses">responses</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label for="profile-base-url">接口地址</label>
+            <input id="profile-base-url" name="base_url" type="text" placeholder="原生可留空，反代填完整地址" />
+          </div>
+          <div class="settings-field">
+            <label for="profile-api-key">方案密钥</label>
+            <input id="profile-api-key" name="api_key" type="password" placeholder="填写该方案专属密钥" />
+            <span class="field-hint" id="profile-key-hint">每个方案独立配置密钥，留空则保留该方案已保存的密钥。</span>
+          </div>
+
+          <div class="settings-actions">
+            <button class="btn-settings primary" id="activate-profile" type="button">设为当前</button>
+            <button class="btn-settings ghost" id="save-profile" type="submit">保存方案</button>
+            <button class="btn-settings ghost" id="new-profile" type="button">新建方案</button>
+            <button class="btn-settings danger" id="delete-profile" type="button">删除方案</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ===== TOOLS 管理抽屉 ===== -->
+    <div class="cap-drawer-overlay" id="tools-overlay"></div>
+    <div class="cap-drawer" id="tools-drawer" role="dialog" aria-label="TOOLS">
+      <div class="cap-drawer-header">
+        <span class="cap-drawer-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
+          TOOLS
+        </span>
+        <button class="btn-close-drawer" id="btn-close-tools" type="button" aria-label="关闭 TOOLS">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="cap-drawer-toolbar">
+        <label class="cap-master-switch">
+          <input type="checkbox" id="tools-master-toggle" checked />
+          <span class="cap-master-slider"></span>
+          <span>全局启用</span>
+        </label>
+        <span class="cap-count" id="tools-count">已启用 0 / 0</span>
+      </div>
+      <!-- 添加 TOOL 表单 -->
+      <div class="cap-add-section">
+        <div class="cap-add-header" id="tools-add-toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+          <span>添加 TOOL</span>
+        </div>
+        <form class="cap-add-form hidden" id="tools-add-form" autocomplete="off">
+          <div class="cap-add-field">
+            <input type="text" name="name" placeholder="名称（唯一标识）" required />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="description" placeholder="描述（可选）" />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="endpoint" placeholder="调用地址 / 函数路径" />
+          </div>
+          <div class="cap-add-actions">
+            <button class="btn-settings primary" type="submit">添加</button>
+            <button class="btn-settings ghost" type="button" data-action="cancel">取消</button>
+          </div>
+        </form>
+      </div>
+      <div class="cap-drawer-body">
+        <div class="cap-list" id="tools-list">
+          <div class="cap-empty">暂无已注册 TOOL，点击上方「添加 TOOL」进行注册。</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== MCP 管理抽屉 ===== -->
+    <div class="cap-drawer-overlay" id="mcp-overlay"></div>
+    <div class="cap-drawer" id="mcp-drawer" role="dialog" aria-label="MCP">
+      <div class="cap-drawer-header">
+        <span class="cap-drawer-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          MCP
+        </span>
+        <button class="btn-close-drawer" id="btn-close-mcp" type="button" aria-label="关闭 MCP">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="cap-drawer-toolbar">
+        <label class="cap-master-switch">
+          <input type="checkbox" id="mcp-master-toggle" checked />
+          <span class="cap-master-slider"></span>
+          <span>全局启用</span>
+        </label>
+        <span class="cap-count" id="mcp-count">已启用 0 / 0</span>
+      </div>
+      <!-- 添加 MCP 表单 -->
+      <div class="cap-add-section">
+        <div class="cap-add-header" id="mcp-add-toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+          <span>添加 MCP</span>
+        </div>
+        <form class="cap-add-form hidden" id="mcp-add-form" autocomplete="off">
+          <div class="cap-add-field">
+            <input type="text" name="name" placeholder="名称（唯一标识）" required />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="description" placeholder="描述（可选）" />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="transport" placeholder="传输方式：stdio / sse / streamable-http" />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="command" placeholder="启动命令 / 服务地址" />
+          </div>
+          <div class="cap-add-actions">
+            <button class="btn-settings primary" type="submit">添加</button>
+            <button class="btn-settings ghost" type="button" data-action="cancel">取消</button>
+          </div>
+        </form>
+      </div>
+      <div class="cap-drawer-body">
+        <div class="cap-list" id="mcp-list">
+          <div class="cap-empty">暂无已连接 MCP 服务器，点击上方「添加 MCP」进行配置。</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SKILLS 管理抽屉 ===== -->
+    <div class="cap-drawer-overlay" id="skills-overlay"></div>
+    <div class="cap-drawer" id="skills-drawer" role="dialog" aria-label="SKILLS">
+      <div class="cap-drawer-header">
+        <span class="cap-drawer-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          SKILLS
+        </span>
+        <button class="btn-close-drawer" id="btn-close-skills" type="button" aria-label="关闭 SKILLS">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="cap-drawer-toolbar">
+        <label class="cap-master-switch">
+          <input type="checkbox" id="skills-master-toggle" checked />
+          <span class="cap-master-slider"></span>
+          <span>全局启用</span>
+        </label>
+        <span class="cap-count" id="skills-count">已启用 0 / 0</span>
+      </div>
+      <!-- 添加 SKILL 表单 -->
+      <div class="cap-add-section">
+        <div class="cap-add-header" id="skills-add-toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+          <span>添加 SKILL</span>
+        </div>
+        <form class="cap-add-form hidden" id="skills-add-form" autocomplete="off">
+          <div class="cap-add-field">
+            <input type="text" name="name" placeholder="名称（唯一标识）" required />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="description" placeholder="描述（可选）" />
+          </div>
+          <div class="cap-add-field">
+            <input type="text" name="entry" placeholder="入口路径 / 模块名" />
+          </div>
+          <div class="cap-add-actions">
+            <button class="btn-settings primary" type="submit">添加</button>
+            <button class="btn-settings ghost" type="button" data-action="cancel">取消</button>
+          </div>
+        </form>
+      </div>
+      <div class="cap-drawer-body">
+        <div class="cap-list" id="skills-list">
+          <div class="cap-empty">暂无已注册 SKILL，点击上方「添加 SKILL」进行注册。</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast 通知容器 -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

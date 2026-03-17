@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
-from uuid import uuid4
 
-from .adapters import AdapterHub, LLMAdapter, MCPAdapter, ToolAdapter
-from .contracts.action import AvailableAction
-from .contracts.context import ContextSnapshot, ExecutionContext
-from .contracts.tooling import ToolDefinition
+from .app.runtime import (
+    RuntimeOptions,
+    build_pending_action_arguments,
+    build_perception_payload,
+    build_request_identifiers,
+    build_runtime,
+    extract_constraints,
+    extract_intent_summary,
+    extract_text_from_llm_response,
+    judge_clarify_needed,
+    normalize_goal,
+    prepare_snapshot_for_round,
+    render_round_result,
+    run_single_round,
+)
+from .contracts.context import ContextSnapshot
 from .orchestration import FileBackedSTM, Pipeline, PipelineRoundResult
 
 
@@ -59,6 +69,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="trace_cli",
         help="追踪标识前缀。",
     )
+    parser.add_argument(
+        "--llm-profile",
+        default="",
+        help="默认使用的 LLM 配置方案名称。",
+    )
     args = parser.parse_args(argv)
     _validate_args(args=args, parser=parser)
     return args
@@ -96,31 +111,10 @@ def _validate_args(*, args: argparse.Namespace, parser: argparse.ArgumentParser)
 
 
 def _build_runtime(*, args: argparse.Namespace, project_root: Path) -> tuple[Pipeline, FileBackedSTM]:
-    tool_adapter = ToolAdapter()
-    tool_adapter.register(
-        definition=ToolDefinition(
-            name="search_docs",
-            description="搜索文档",
-            input_schema={"type": "object", "required": []},
-            permission_domain="docs",
-            risk_level="low",
-            idempotent=True,
-            requires_confirmation=False,
-            handler=lambda query="": {
-                "text": f"已执行搜索：{query}" if query else "已执行搜索",
-                "data": {"hits": 1, "query": query},
-            },
-        )
+    return build_runtime(
+        options=RuntimeOptions.from_namespace(args),
+        project_root=project_root,
     )
-
-    adapters = AdapterHub(
-        tool=tool_adapter,
-        llm=LLMAdapter(project_root=project_root, live_mode=args.live_llm),
-        mcp=MCPAdapter(project_root=project_root),
-    )
-    stm = FileBackedSTM(storage_path=project_root / args.stm_path)
-    pipeline = Pipeline(adapters=adapters, stm=stm)
-    return pipeline, stm
 
 
 def _run_single_round(
@@ -132,39 +126,13 @@ def _run_single_round(
     action_type: str,
     target: str | None,
 ) -> PipelineRoundResult:
-    snapshot = stm.latest_context_snapshot()
-    snapshot = _prepare_snapshot_for_round(
-        snapshot=snapshot,
+    return run_single_round(
+        options=RuntimeOptions.from_namespace(args),
+        pipeline=pipeline,
+        stm=stm,
         goal=goal,
         action_type=action_type,
         target=target,
-        draft_answer=args.draft_answer,
-    )
-
-    request_id, trace_id = _build_request_identifiers(
-        request_prefix=args.request_prefix,
-        trace_prefix=args.trace_prefix,
-        action_type=action_type,
-    )
-    execution_context = ExecutionContext(
-        request_id=request_id,
-        session_id=args.session_id,
-        plan_id=snapshot.current_plan.plan_id if snapshot.current_plan is not None else None,
-        trace_id=trace_id,
-        source="react",
-    )
-
-    return pipeline.run_round(
-        goal=goal,
-        context_snapshot=snapshot,
-        available_actions=[
-            AvailableAction(
-                action_type=action_type,
-                targets=[target] if target else [],
-                availability="available",
-            )
-        ],
-        execution_context=execution_context,
     )
 
 
@@ -267,31 +235,17 @@ def _prepare_snapshot_for_round(
     goal: str,
     action_type: str,
     target: str | None,
+    profile_name: str | None = None,
     draft_answer: str,
 ) -> ContextSnapshot:
-    perception = dict(snapshot.perception)
-    perception.update(
-        _build_perception_payload(
-            goal=goal,
-            action_type=action_type,
-            target=target,
-        )
-    )
-
-    pending_action_arguments = _build_pending_action_arguments(
+    return prepare_snapshot_for_round(
+        snapshot=snapshot,
+        goal=goal,
         action_type=action_type,
         target=target,
-        goal=goal,
+        profile_name=profile_name,
+        draft_answer=draft_answer,
     )
-    if pending_action_arguments is not None:
-        perception["pending_action_arguments"] = pending_action_arguments
-    else:
-        perception.pop("pending_action_arguments", None)
-
-    update: dict[str, object] = {"perception": perception}
-    if action_type == "finish" and snapshot.last_observation is None:
-        update["last_observation"] = {"draft_answer": draft_answer}
-    return snapshot.model_copy(update=update)
 
 
 def _build_perception_payload(
@@ -300,30 +254,11 @@ def _build_perception_payload(
     action_type: str,
     target: str | None,
 ) -> dict[str, object]:
-    normalized_goal = _normalize_goal(goal=goal)
-    constraints = _extract_constraints(goal=normalized_goal)
-    intent_summary = _extract_intent_summary(
-        goal=normalized_goal,
-        constraints=constraints,
-    )
-    clarify_needed, clarify_reason = _judge_clarify_needed(
-        normalized_goal=normalized_goal,
+    return build_perception_payload(
+        goal=goal,
         action_type=action_type,
         target=target,
-        intent_summary=intent_summary,
     )
-    perception: dict[str, object] = {
-        "pending_user_message": goal,
-        "normalized_goal": normalized_goal,
-        "intent_summary": intent_summary,
-        "constraints": constraints,
-        "clarify_needed": clarify_needed,
-    }
-    if clarify_reason is not None:
-        perception["clarify_reason"] = clarify_reason
-    else:
-        perception.pop("clarify_reason", None)
-    return perception
 
 
 def _build_pending_action_arguments(
@@ -331,47 +266,26 @@ def _build_pending_action_arguments(
     action_type: str,
     target: str | None,
     goal: str,
+    profile_name: str | None = None,
 ) -> dict[str, object] | None:
-    if action_type == "mcp" and target == "cunzhi:zhi":
-        return {"message": goal, "is_markdown": True}
-    if action_type == "tool" and target == "search_docs":
-        return {"query": goal}
-    if action_type in {"tool", "mcp"}:
-        return {}
-    return None
+    return build_pending_action_arguments(
+        action_type=action_type,
+        target=target,
+        goal=goal,
+        profile_name=profile_name,
+    )
 
 
 def _normalize_goal(*, goal: str) -> str:
-    return " ".join(goal.strip().split())
+    return normalize_goal(goal=goal)
 
 
 def _extract_constraints(*, goal: str) -> list[str]:
-    if not goal:
-        return []
-    segments = [
-        segment.strip()
-        for segment in re.split(r"[，,。；;\n]+", goal)
-        if segment.strip()
-    ]
-    return [
-        segment
-        for segment in segments
-        if any(keyword in segment for keyword in ("只", "必须", "不要", "不能", "限定", "仅"))
-    ]
+    return extract_constraints(goal=goal)
 
 
 def _extract_intent_summary(*, goal: str, constraints: list[str]) -> str:
-    if not goal:
-        return ""
-    segments = [
-        segment.strip()
-        for segment in re.split(r"[，,。；;\n]+", goal)
-        if segment.strip()
-    ]
-    intent_segments = [segment for segment in segments if segment not in constraints]
-    if not intent_segments:
-        return goal
-    return "；".join(intent_segments)
+    return extract_intent_summary(goal=goal, constraints=constraints)
 
 
 def _judge_clarify_needed(
@@ -381,14 +295,12 @@ def _judge_clarify_needed(
     target: str | None,
     intent_summary: str,
 ) -> tuple[bool, str | None]:
-    if not normalized_goal:
-        return (True, "目标为空。")
-    if action_type in {"tool", "mcp", "skill", "rag"} and not target:
-        return (True, "缺少动作目标。")
-    vague_goals = {"处理一下", "看一下", "搞一下", "弄一下", "帮我处理一下", "帮我看一下"}
-    if normalized_goal in vague_goals and not intent_summary:
-        return (True, "缺少明确意图。")
-    return (False, None)
+    return judge_clarify_needed(
+        normalized_goal=normalized_goal,
+        action_type=action_type,
+        target=target,
+        intent_summary=intent_summary,
+    )
 
 
 def _build_request_identifiers(
@@ -397,66 +309,19 @@ def _build_request_identifiers(
     trace_prefix: str,
     action_type: str,
 ) -> tuple[str, str]:
-    token = uuid4().hex[:8]
-    return (
-        f"{request_prefix}.{token}",
-        f"{trace_prefix}.{action_type}.{token}",
+    return build_request_identifiers(
+        request_prefix=request_prefix,
+        trace_prefix=trace_prefix,
+        action_type=action_type,
     )
 
 
 def _render_round_result(*, result: PipelineRoundResult) -> str:
-    if result.output_text:
-        return result.output_text
-
-    observation = result.observation or {}
-    source = observation.get("source")
-
-    if source == "llm":
-        response = observation.get("response")
-        if isinstance(response, dict):
-            text = _extract_text_from_llm_response(response=response)
-            if text:
-                return text
-        return "LLM 已返回结果，但未提取到文本。"
-
-    if source in {"tool", "mcp"}:
-        result_payload = observation.get("result")
-        if isinstance(result_payload, dict):
-            text = result_payload.get("text")
-            if isinstance(text, str) and text:
-                return text
-            return json.dumps(result_payload, ensure_ascii=False, indent=2)
-
-    if source == "rag":
-        result_payload = observation.get("result")
-        return json.dumps(result_payload, ensure_ascii=False, indent=2)
-
-    if source == "skill":
-        result_payload = observation.get("result")
-        return json.dumps(result_payload, ensure_ascii=False, indent=2)
-
-    final_answer = result.react_result.final_answer
-    if isinstance(final_answer, str) and final_answer:
-        return final_answer
-
-    return json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2)
+    return render_round_result(result=result)
 
 
 def _extract_text_from_llm_response(*, response: dict[str, object]) -> str:
-    blocks = response.get("content_blocks", [])
-    if not isinstance(blocks, list):
-        return ""
-
-    texts: list[str] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") != "text":
-            continue
-        content = block.get("content")
-        if isinstance(content, str) and content:
-            texts.append(content)
-    return "\n".join(texts)
+    return extract_text_from_llm_response(response=response)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,9 @@ class MCPAdapter:
         self._settings = settings or load_runtime_settings(project_root)
         self._client_factory = client_factory
 
+    def list_servers(self) -> list[MCPServerSettings]:
+        return sorted(self._settings.mcp_servers.values(), key=lambda server: server.name)
+
     def register(
         self,
         *,

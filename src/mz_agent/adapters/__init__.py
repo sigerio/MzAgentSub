@@ -79,6 +79,7 @@ class AdapterHub:
             raw_tool_schemas = action_input.get("tool_schemas", [])
             raw_response_schema = action_input.get("response_schema")
             raw_route_hint = action_input.get("route_hint")
+            raw_profile_name = action_input.get("profile_name")
             raw_timeout = action_input.get("timeout")
             raw_stream = action_input.get("stream")
             request = LLMRequest(
@@ -92,6 +93,9 @@ class AdapterHub:
                     )
                 ],
                 model_policy=str(action_input.get("model_policy", "quality")),
+                profile_name=(
+                    raw_profile_name if isinstance(raw_profile_name, str) and raw_profile_name else None
+                ),
                 route_hint=raw_route_hint if isinstance(raw_route_hint, str) else None,
                 tool_schemas=raw_tool_schemas if isinstance(raw_tool_schemas, list) else [],
                 response_schema=(

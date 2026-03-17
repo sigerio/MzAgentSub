@@ -124,17 +124,25 @@ def _apply_conversation_writeback(
 ) -> dict[str, object]:
     perception_state = dict(snapshot.perception)
     history = _read_conversation_history(perception=snapshot.perception)
+    round_id = perception_state.get("pending_round_id")
 
     pending_user_message = perception_state.get("pending_user_message")
     if isinstance(pending_user_message, str) and pending_user_message:
-        history.append({"role": "user", "content": pending_user_message})
+        message: dict[str, str] = {"role": "user", "content": pending_user_message}
+        if isinstance(round_id, str) and round_id:
+            message["round_id"] = round_id
+        history.append(message)
 
     assistant_text = _extract_assistant_text(record=record)
     if assistant_text:
-        history.append({"role": "assistant", "content": assistant_text})
+        message = {"role": "assistant", "content": assistant_text}
+        if isinstance(round_id, str) and round_id:
+            message["round_id"] = round_id
+        history.append(message)
 
     perception_state["conversation_messages"] = history
     perception_state.pop("pending_user_message", None)
+    perception_state.pop("pending_round_id", None)
     return perception_state
 
 
@@ -149,7 +157,11 @@ def _read_conversation_history(*, perception: dict[str, object]) -> list[dict[st
         role = item.get("role")
         content = item.get("content")
         if isinstance(role, str) and isinstance(content, str):
-            history.append({"role": role, "content": content})
+            message = {"role": role, "content": content}
+            round_id = item.get("round_id")
+            if isinstance(round_id, str) and round_id:
+                message["round_id"] = round_id
+            history.append(message)
     return history
 
 

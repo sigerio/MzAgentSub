@@ -29,9 +29,9 @@ class LLMAdapter:
         live_mode: bool | None = None,
     ) -> None:
         self._responder = responder
+        self._project_root = project_root
         self._settings = settings or load_runtime_settings(project_root)
         self._client_factory = client_factory
-        self._client: object | None = None
         self._live_mode = live_mode if live_mode is not None else client_factory is not None
 
     def respond(
@@ -40,6 +40,7 @@ class LLMAdapter:
         request: LLMRequest,
         execution_context: ExecutionContext,
     ) -> LLMResponse:
+        settings = self._resolve_settings(request=request)
         raw_result = self._responder(request) if self._responder is not None else None
 
         if isinstance(raw_result, LLMResponse):
@@ -53,13 +54,15 @@ class LLMAdapter:
                 request=request,
                 execution_context=execution_context,
                 text=raw_result,
+                settings=settings,
             )
 
-        if self._live_mode and self._settings.llm.is_configured():
+        if self._live_mode and settings.llm.is_configured():
             try:
                 return self._respond_via_provider(
                     request=request,
                     execution_context=execution_context,
+                    settings=settings,
                 )
             except ModuleNotFoundError as exc:
                 if exc.name != "openai":
@@ -69,6 +72,7 @@ class LLMAdapter:
             request=request,
             execution_context=execution_context,
             text=self._default_text(request=request),
+            settings=settings,
         )
 
     def _respond_via_provider(
@@ -76,9 +80,12 @@ class LLMAdapter:
         *,
         request: LLMRequest,
         execution_context: ExecutionContext,
+        settings: RuntimeSettings,
     ) -> LLMResponse:
-        client = self._get_client()
-        model_name = request.route_hint or self._settings.llm.model_id or "openai-default"
+        if settings.llm.provider_type not in {"openai_native", "openai_compatible_proxy"}:
+            raise ValueError(f"当前未支持的 provider_type：{settings.llm.provider_type}")
+        client = self._get_client(settings=settings)
+        model_name = request.route_hint or settings.llm.model_id or "openai-default"
         start_time = time.perf_counter()
         response = client.responses.create(
             model=model_name,
@@ -91,33 +98,30 @@ class LLMAdapter:
         return self._normalize_provider_response(
             request=request,
             execution_context=execution_context,
+            settings=settings,
             model_name=model_name,
             response=response,
             latency_ms=latency_ms,
         )
 
-    def _get_client(self) -> object:
-        if self._client is not None:
-            return self._client
-
+    def _get_client(self, *, settings: RuntimeSettings) -> object:
         if self._client_factory is not None:
-            self._client = self._client_factory(self._settings)
-            return self._client
+            return self._client_factory(settings)
 
         from openai import OpenAI
 
-        self._client = OpenAI(
-            api_key=self._settings.llm.api_key,
-            base_url=self._settings.llm.base_url,
-            timeout=self._settings.llm.timeout,
+        return OpenAI(
+            api_key=settings.llm.api_key,
+            base_url=settings.llm.base_url,
+            timeout=settings.llm.timeout,
         )
-        return self._client
 
     def _normalize_provider_response(
         self,
         *,
         request: LLMRequest,
         execution_context: ExecutionContext,
+        settings: RuntimeSettings,
         model_name: str,
         response: object,
         latency_ms: int,
@@ -134,13 +138,17 @@ class LLMAdapter:
         tool_calls = self._extract_tool_calls(response=response)
         usage = self._extract_usage(response=response)
         provider_trace = ProviderTrace(
-            provider="openai",
+            provider=settings.llm.provider_type,
             model=model_name,
-            api_mode="responses",
+            api_mode=settings.llm.api_mode,
+            profile_name=settings.llm.profile_name,
             stream=request.stream,
             attempt=1,
         )
-        raw_response_meta: dict[str, object] = {"trace_id": execution_context.trace_id}
+        raw_response_meta: dict[str, object] = {
+            "trace_id": execution_context.trace_id,
+            "profile_name": settings.llm.profile_name,
+        }
 
         response_id = getattr(response, "id", None)
         if response_id is not None:
@@ -166,6 +174,7 @@ class LLMAdapter:
         request: LLMRequest,
         execution_context: ExecutionContext,
         text: str,
+        settings: RuntimeSettings,
     ) -> LLMResponse:
         completion_tokens = max(1, len(text) // 8) if text else 1
         return LLMResponse(
@@ -177,16 +186,27 @@ class LLMAdapter:
                 total_tokens=len(request.messages) + completion_tokens,
             ),
             provider_trace=ProviderTrace(
-                provider="openai",
-                model=request.route_hint or "openai-default",
+                provider=settings.llm.provider_type,
+                model=request.route_hint or settings.llm.model_id or "openai-default",
                 api_mode="stub",
+                profile_name=settings.llm.profile_name,
                 stream=request.stream,
                 attempt=1,
             ),
             finish_reason="stop",
             latency_ms=0,
-            raw_response_meta={"trace_id": execution_context.trace_id},
+            raw_response_meta={
+                "trace_id": execution_context.trace_id,
+                "profile_name": settings.llm.profile_name,
+            },
         )
+
+    def _resolve_settings(self, *, request: LLMRequest) -> RuntimeSettings:
+        if self._project_root is not None:
+            return load_runtime_settings(self._project_root, profile_name=request.profile_name)
+        if request.profile_name and request.profile_name != self._settings.llm.profile_name:
+            raise ValueError(f"当前运行时未加载配置方案：{request.profile_name}")
+        return self._settings
 
     @staticmethod
     def _default_text(*, request: LLMRequest) -> str:

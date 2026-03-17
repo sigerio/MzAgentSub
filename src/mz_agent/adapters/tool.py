@@ -14,6 +14,9 @@ class ToolAdapter:
     def register(self, *, definition: ToolDefinition) -> None:
         self._definitions[definition.name] = definition
 
+    def list_definitions(self) -> list[ToolDefinition]:
+        return sorted(self._definitions.values(), key=lambda definition: definition.name)
+
     def execute(self, *, request: ToolExecutionRequest) -> ToolExecutionResult:
         definition = self._definitions.get(request.tool_name)
         if definition is None:
@@ -108,4 +111,3 @@ class ToolAdapter:
             text=str(raw_result),
             result_schema_version=result_schema_version,
         )
-

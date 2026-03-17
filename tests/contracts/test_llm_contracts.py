@@ -19,6 +19,7 @@ def test_llm_request_accepts_minimal_valid_payload() -> None:
     assert request.model_dump(mode="json") == {
         "messages": [{"role": "user", "content": "你好"}],
         "model_policy": "quality",
+        "profile_name": None,
         "route_hint": None,
         "tool_schemas": [{"name": "echo"}],
         "response_schema": {"type": "object"},
@@ -36,6 +37,7 @@ def test_llm_response_dump_is_stable() -> None:
             provider="openai",
             model="gpt-test",
             api_mode="chat",
+            profile_name="default",
             stream=False,
             attempt=1,
         ),
@@ -56,6 +58,7 @@ def test_llm_response_dump_is_stable() -> None:
             "provider": "openai",
             "model": "gpt-test",
             "api_mode": "chat",
+            "profile_name": "default",
             "stream": False,
             "attempt": 1,
         },
@@ -63,4 +66,3 @@ def test_llm_response_dump_is_stable() -> None:
         "latency_ms": 12,
         "raw_response_meta": {"trace_id": "trace_001"},
     }
-

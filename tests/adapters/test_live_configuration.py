@@ -38,6 +38,9 @@ tool_timeout_sec = 12.5
 
     settings = load_runtime_settings(tmp_path)
 
+    assert settings.default_profile_name == "default"
+    assert settings.llm.profile_name == "default"
+    assert settings.llm.provider_type == "openai_compatible_proxy"
     assert settings.llm.model_id == "gpt-test"
     assert settings.llm.api_key == "sk-test"
     assert settings.llm.base_url == "https://example.com/v1"
@@ -134,7 +137,9 @@ def test_llm_adapter_maps_provider_response_to_contracts(tmp_path: Path) -> None
     assert result.usage is not None
     assert result.usage.total_tokens == 12
     assert result.provider_trace is not None
+    assert result.provider_trace.provider == "openai_compatible_proxy"
     assert result.provider_trace.api_mode == "responses"
+    assert result.provider_trace.profile_name == "default"
     assert result.raw_response_meta["response_id"] == "resp_001"
 
 
@@ -235,6 +240,7 @@ def test_adapter_hub_preserves_llm_request_fields() -> None:
             action_input={
                 "messages": [{"role": "user", "content": "你好"}],
                 "model_policy": "fast",
+                "profile_name": "default",
                 "route_hint": "gpt-5.4",
                 "tool_schemas": [{"name": "echo"}],
                 "response_schema": {"type": "object"},
@@ -248,6 +254,7 @@ def test_adapter_hub_preserves_llm_request_fields() -> None:
     request = captured["request"]
     assert isinstance(request, LLMRequest)
     assert request.model_policy == "fast"
+    assert request.profile_name == "default"
     assert request.route_hint == "gpt-5.4"
     assert request.tool_schemas == [{"name": "echo"}]
     assert request.response_schema == {"type": "object"}

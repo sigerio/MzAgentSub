@@ -49,6 +49,9 @@ class SkillAdapter:
             )
         return results
 
+    def list_skill_names(self) -> list[str]:
+        return [item["name"] for item in self.list_skills() if isinstance(item.get("name"), str)]
+
     def consume(
         self,
         *,

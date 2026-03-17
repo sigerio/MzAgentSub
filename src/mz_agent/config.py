@@ -1,11 +1,15 @@
 """MzAgent 运行时配置装载。"""
 
 from __future__ import annotations
-
-import os
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from .llm_profiles import (
+    LLMProfile,
+    ProfileProviderType,
+    load_profile_store,
+)
 
 try:
     import tomllib
@@ -16,13 +20,36 @@ except ModuleNotFoundError:  # pragma: no cover
 class LLMSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    profile_name: str | None = None
+    provider_type: ProfileProviderType = "openai_native"
     model_id: str | None = None
     api_key: str | None = None
     base_url: str | None = None
+    api_mode: str = "responses"
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    enabled_capabilities: list[str] = Field(default_factory=list)
     timeout: int = Field(default=60, ge=1)
 
     def is_configured(self) -> bool:
-        return bool(self.model_id and self.api_key and self.base_url)
+        if not self.model_id or not self.api_key:
+            return False
+        if self.provider_type == "openai_native":
+            return True
+        return bool(self.base_url)
+
+    @classmethod
+    def from_profile(cls, profile: LLMProfile) -> "LLMSettings":
+        return cls(
+            profile_name=profile.profile_name,
+            provider_type=profile.provider_type,
+            model_id=profile.default_model,
+            api_key=profile.api_key,
+            base_url=profile.base_url,
+            api_mode=profile.api_mode,
+            extra_headers=dict(profile.extra_headers),
+            enabled_capabilities=list(profile.enabled_capabilities),
+            timeout=profile.timeout,
+        )
 
 
 class MCPServerSettings(BaseModel):
@@ -41,23 +68,32 @@ class RuntimeSettings(BaseModel):
 
     project_root: Path
     llm: LLMSettings
+    default_profile_name: str | None = None
+    llm_profiles: dict[str, LLMProfile] = Field(default_factory=dict)
     mcp_servers: dict[str, MCPServerSettings] = Field(default_factory=dict)
 
 
-def load_runtime_settings(project_root: str | Path | None = None) -> RuntimeSettings:
+def load_runtime_settings(
+    project_root: str | Path | None = None,
+    *,
+    profile_name: str | None = None,
+) -> RuntimeSettings:
     root = discover_project_root(project_root)
     env_values = load_env_file(root / ".env")
-
-    llm = LLMSettings(
-        model_id=_pick_value("LLM_MODEL_ID", env_values),
-        api_key=_pick_value("LLM_API_KEY", env_values),
-        base_url=_pick_value("LLM_BASE_URL", env_values),
-        timeout=_read_timeout(env_values),
-    )
+    profile_store = load_profile_store(project_root=root, env_values=env_values)
+    selected_profile_name = profile_name or profile_store.default_profile_name
+    selected_profile = profile_store.require(selected_profile_name)
+    llm = LLMSettings.from_profile(selected_profile)
 
     pyproject_data = load_pyproject(root / "pyproject.toml")
     mcp_servers = parse_mcp_servers(pyproject_data)
-    return RuntimeSettings(project_root=root, llm=llm, mcp_servers=mcp_servers)
+    return RuntimeSettings(
+        project_root=root,
+        llm=llm,
+        default_profile_name=profile_store.default_profile_name,
+        llm_profiles=profile_store.profile_map(),
+        mcp_servers=mcp_servers,
+    )
 
 
 def discover_project_root(project_root: str | Path | None = None) -> Path:
@@ -132,22 +168,3 @@ def parse_mcp_servers(pyproject_data: dict[str, object]) -> dict[str, MCPServerS
             tool_timeout_sec=float(raw_server.get("tool_timeout_sec", 600.0)),
         )
     return servers
-
-
-def _pick_value(key: str, env_values: dict[str, str]) -> str | None:
-    current = os.getenv(key)
-    if current:
-        return current
-    value = env_values.get(key)
-    return value or None
-
-
-def _read_timeout(env_values: dict[str, str]) -> int:
-    raw_timeout = _pick_value("LLM_TIMEOUT", env_values)
-    if raw_timeout is None:
-        return 60
-    try:
-        timeout = int(raw_timeout)
-    except ValueError:
-        return 60
-    return timeout if timeout > 0 else 60

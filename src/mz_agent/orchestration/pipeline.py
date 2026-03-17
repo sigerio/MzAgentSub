@@ -47,6 +47,10 @@ class Pipeline:
         self._guardrails = guardrails_evaluator or StaticGuardrailsEvaluator()
         self._stm = stm or InMemorySTM()
 
+    @property
+    def adapters(self) -> AdapterHub:
+        return self._adapters
+
     def run_round(
         self,
         *,
