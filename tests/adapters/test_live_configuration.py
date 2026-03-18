@@ -3,14 +3,14 @@ from pathlib import Path
 from mz_agent.adapters import AdapterHub
 from mz_agent.adapters.llm import LLMAdapter
 from mz_agent.adapters.mcp import MCPAdapter
-from mz_agent.contracts.action import NextAction
 from mz_agent.config import load_runtime_settings
+from mz_agent.contracts.action import NextAction
 from mz_agent.contracts.context import ExecutionContext
 from mz_agent.contracts.llm import LLMMessage, LLMRequest
 from mz_agent.contracts.tooling import ToolExecutionResult
 
 
-def test_runtime_settings_load_env_and_mcp_server_from_project_root(tmp_path: Path) -> None:
+def test_runtime_settings_load_profile_store_and_mcp_server_from_project_root(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         """
 [project]
@@ -24,26 +24,38 @@ tool_timeout_sec = 12.5
 """.strip(),
         encoding="utf-8",
     )
-    (tmp_path / ".env").write_text(
-        "\n".join(
-            [
-                "LLM_MODEL_ID=gpt-test",
-                "LLM_API_KEY=sk-test",
-                "LLM_BASE_URL=https://example.com/v1",
-                "LLM_TIMEOUT=45",
-            ]
-        ),
+    (tmp_path / ".mz_agent").mkdir()
+    (tmp_path / ".mz_agent" / "llm_profiles.json").write_text(
+        """
+{
+  "connection": {
+    "base_url": "https://example.com/v1",
+    "api_key": "sk-test",
+    "timeout": 45
+  },
+  "active_profile_name": "gpt-test",
+  "profiles": [
+    {
+      "profile_name": "gpt-test",
+      "display_name": "GPT Test",
+      "model_name": "gpt-test",
+      "extra_headers": {},
+      "enabled_capabilities": []
+    }
+  ]
+}
+""".strip(),
         encoding="utf-8",
     )
 
     settings = load_runtime_settings(tmp_path)
 
-    assert settings.default_profile_name == "default"
-    assert settings.llm.profile_name == "default"
-    assert settings.llm.provider_type == "openai_compatible_proxy"
+    assert settings.active_profile_name == "gpt-test"
+    assert settings.llm.profile_name == "gpt-test"
     assert settings.llm.model_id == "gpt-test"
     assert settings.llm.api_key == "sk-test"
     assert settings.llm.base_url == "https://example.com/v1"
+    assert settings.llm.api_mode == "openai-responses"
     assert settings.llm.timeout == 45
     assert settings.mcp_servers["cunzhi"].command == "/tmp/cz.exe"
     assert settings.mcp_servers["cunzhi"].tool_timeout_sec == 12.5
@@ -54,14 +66,27 @@ def test_llm_adapter_maps_provider_response_to_contracts(tmp_path: Path) -> None
         '[project]\nname = "demo"\nversion = "0.0.1"\n',
         encoding="utf-8",
     )
-    (tmp_path / ".env").write_text(
-        "\n".join(
-            [
-                "LLM_MODEL_ID=gpt-real",
-                "LLM_API_KEY=sk-test",
-                "LLM_BASE_URL=https://example.com/v1",
-            ]
-        ),
+    (tmp_path / ".mz_agent").mkdir()
+    (tmp_path / ".mz_agent" / "llm_profiles.json").write_text(
+        """
+{
+  "connection": {
+    "base_url": "https://example.com/v1",
+    "api_key": "sk-test",
+    "timeout": 60
+  },
+  "active_profile_name": "gpt-real",
+  "profiles": [
+    {
+      "profile_name": "gpt-real",
+      "display_name": "GPT Real",
+      "model_name": "gpt-real",
+      "extra_headers": {},
+      "enabled_capabilities": []
+    }
+  ]
+}
+""".strip(),
         encoding="utf-8",
     )
 
@@ -137,10 +162,92 @@ def test_llm_adapter_maps_provider_response_to_contracts(tmp_path: Path) -> None
     assert result.usage is not None
     assert result.usage.total_tokens == 12
     assert result.provider_trace is not None
-    assert result.provider_trace.provider == "openai_compatible_proxy"
-    assert result.provider_trace.api_mode == "responses"
-    assert result.provider_trace.profile_name == "default"
+    assert result.provider_trace.provider == "newapi"
+    assert result.provider_trace.api_mode == "openai-responses"
+    assert result.provider_trace.profile_name == "gpt-real"
     assert result.raw_response_meta["response_id"] == "resp_001"
+
+
+def test_llm_adapter_can_dispatch_chat_completions_mode(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.0.1"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".mz_agent").mkdir()
+    (tmp_path / ".mz_agent" / "llm_profiles.json").write_text(
+        """
+{
+  "connection": {
+    "base_url": "https://example.com/v1",
+    "api_key": "sk-test",
+    "timeout": 60
+  },
+  "active_profile_name": "gpt-chat",
+  "profiles": [
+    {
+      "profile_name": "gpt-chat",
+      "display_name": "GPT Chat",
+      "model_name": "gpt-chat",
+      "api_mode": "openai-completions",
+      "extra_headers": {},
+      "enabled_capabilities": []
+    }
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class FakeChatCompletionsAPI:
+        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+            assert kwargs["model"] == "gpt-chat"
+            assert kwargs["messages"] == [{"role": "user", "content": "你好"}]
+            message = type("Message", (), {"content": "聊天完成", "tool_calls": []})()
+            choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+            usage = type(
+                "Usage",
+                (),
+                {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+            )()
+            return type(
+                "Response",
+                (),
+                {
+                    "id": "chatcmpl_001",
+                    "_request_id": "req_chat_001",
+                    "choices": [choice],
+                    "usage": usage,
+                },
+            )()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.chat = type("Chat", (), {"completions": FakeChatCompletionsAPI()})()
+
+    adapter = LLMAdapter(
+        project_root=tmp_path,
+        client_factory=lambda settings: FakeClient(),
+    )
+    execution_context = ExecutionContext(
+        request_id="req_001",
+        session_id="sess_001",
+        plan_id=None,
+        trace_id="trace_001",
+        source="llm",
+    )
+
+    result = adapter.respond(
+        request=LLMRequest(
+            messages=[LLMMessage(role="user", content="你好")],
+            model_policy="quality",
+        ),
+        execution_context=execution_context,
+    )
+
+    assert result.content_blocks[0].content == "聊天完成"
+    assert result.provider_trace is not None
+    assert result.provider_trace.api_mode == "openai-completions"
+    assert result.raw_response_meta["response_id"] == "chatcmpl_001"
 
 
 def test_mcp_adapter_reads_server_from_pyproject_and_uses_client_factory(tmp_path: Path) -> None:

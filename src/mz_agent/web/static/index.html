@@ -7,6 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js/styles/github-dark.min.css" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body data-session-id="__SESSION_ID__">
@@ -76,9 +77,11 @@
             <button class="btn-sidebar-toggle" id="btn-sidebar-toggle" type="button" aria-label="切换侧边栏">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><path d="M3 6h18"/><path d="M3 18h18"/></svg>
             </button>
-            <select class="topbar-model-select" id="profile-selector" aria-label="选择连接方案">
-              <!-- 由 JS 动态填充 -->
-            </select>
+            <div id="profile-selector-wrap">
+              <select class="topbar-model-select" id="profile-selector" aria-label="选择连接方案">
+                <!-- 由 JS 动态填充 -->
+              </select>
+            </div>
             <span class="status-dot" id="status-dot" title="待输入"></span>
             <span class="session-id-label" id="session-id">__SESSION_ID__</span>
           </div>
@@ -166,50 +169,59 @@
       </div>
       <div class="settings-drawer-body">
         <form id="profile-form" autocomplete="off">
-          <div class="settings-group-label">方案选择</div>
+          <div class="settings-group-label">连接配置</div>
           <div class="settings-field">
-            <label for="profile-selector-drawer">当前方案</label>
-            <select id="profile-selector-drawer" name="profile_selector_drawer"></select>
-          </div>
-
-          <div class="settings-group-label">方案配置</div>
-          <div class="settings-field">
-            <label for="profile-name">方案名</label>
-            <input id="profile-name" name="profile_name" type="text" placeholder="例如：Claude 反代" />
+            <label for="profile-base-url">NewAPI Base URL</label>
+            <input id="profile-base-url" name="base_url" type="text" placeholder="例如：https://api.example.com/v1" />
           </div>
           <div class="settings-field">
-            <label for="profile-provider-type">类型</label>
-            <select id="profile-provider-type" name="provider_type">
-              <option value="openai_native">原生 OpenAI</option>
-              <option value="openai_compatible_proxy">反代兼容接口</option>
-            </select>
+            <label for="profile-api-key">NewAPI API Key</label>
+            <input id="profile-api-key" name="api_key" type="password" placeholder="填写当前站点的 API Key" />
+            <span class="field-hint" id="profile-key-hint">保存连接后即可从站点获取可用模型。</span>
           </div>
-          <div class="settings-field">
-            <label for="profile-model">默认模型</label>
-            <input id="profile-model" name="default_model" type="text" placeholder="例如：gpt-4o-mini" />
-          </div>
-          <div class="settings-field">
-            <label for="profile-api-mode">接口模式</label>
-            <select id="profile-api-mode" name="api_mode">
-              <option value="responses">responses</option>
-            </select>
-          </div>
-          <div class="settings-field">
-            <label for="profile-base-url">接口地址</label>
-            <input id="profile-base-url" name="base_url" type="text" placeholder="原生可留空，反代填完整地址" />
-          </div>
-          <div class="settings-field">
-            <label for="profile-api-key">方案密钥</label>
-            <input id="profile-api-key" name="api_key" type="password" placeholder="填写该方案专属密钥" />
-            <span class="field-hint" id="profile-key-hint">每个方案独立配置密钥，留空则保留该方案已保存的密钥。</span>
-          </div>
-
           <div class="settings-actions">
-            <button class="btn-settings primary" id="activate-profile" type="button">设为当前</button>
-            <button class="btn-settings ghost" id="save-profile" type="submit">保存方案</button>
-            <button class="btn-settings ghost" id="new-profile" type="button">新建方案</button>
-            <button class="btn-settings danger" id="delete-profile" type="button">删除方案</button>
+            <button class="btn-settings primary" id="save-connection" type="button">保存连接</button>
+            <button class="btn-settings ghost" id="discover-models" type="button">获取模型</button>
           </div>
+          <div class="profile-test-result hidden" id="connection-result" aria-live="polite"></div>
+
+          <div id="discovered-model-section">
+            <div class="settings-group-label">站点模型</div>
+            <div class="settings-field">
+              <label for="discovered-model-selector">可添加模型</label>
+              <select id="discovered-model-selector" name="discovered_model_selector"></select>
+              <span class="field-hint">先从当前 NewAPI 站点拉取模型列表，再选择需要添加的模型。</span>
+            </div>
+            <div class="settings-field">
+              <label for="profile-api-mode">请求协议</label>
+              <select id="profile-api-mode" name="api_mode">
+                <option value="openai-responses">OpenAI Responses</option>
+                <option value="openai-completions">OpenAI Chat</option>
+                <option value="anthropic-messages">Anthropic Messages</option>
+              </select>
+              <span class="field-hint">同一站点下的不同模型可能要求不同协议，添加模型时需要显式绑定。</span>
+            </div>
+            <div class="settings-actions settings-actions-after-select">
+              <button class="btn-settings ghost" id="add-model" type="button">添加模型</button>
+            </div>
+          </div>
+
+          <div id="active-model-section">
+            <div class="settings-group-label">已添加模型</div>
+            <div class="settings-field">
+              <label for="profile-selector-drawer">当前模型</label>
+              <select id="profile-selector-drawer" name="profile_selector_drawer"></select>
+              <span class="field-hint" id="active-profile-mode-hint">当前模型的请求协议会在这里显示。</span>
+            </div>
+            <div class="settings-actions settings-actions-after-select">
+              <button class="btn-settings primary" id="activate-profile" type="button">启用模型</button>
+              <button class="btn-settings ghost" id="test-profile" type="button">测试模型</button>
+              <button class="btn-settings danger" id="delete-profile" type="button">删除模型</button>
+            </div>
+          </div>
+          <div class="settings-empty-state hidden" id="settings-empty-state" aria-live="polite"></div>
+          <div class="profile-test-note">当前阶段仅支持启用一个模型。添加多个模型后，系统运行时只会使用当前启用的那个模型。</div>
+          <div class="profile-test-result hidden" id="profile-test-result" aria-live="polite"></div>
         </form>
       </div>
     </div>
@@ -367,6 +379,9 @@
     <!-- Toast 通知容器 -->
     <div class="toast-container" id="toast-container"></div>
 
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/lib/marked.umd.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js/lib/common.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

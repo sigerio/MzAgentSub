@@ -24,6 +24,7 @@ const el = {
   skillsBadge: $("skills-badge"),
 
   /* 顶栏 */
+  profileSelectorWrap: $("profile-selector-wrap"),
   profileSelector: $("profile-selector"),
   statusDot: $("status-dot"),
   sessionId: $("session-id"),
@@ -51,17 +52,23 @@ const el = {
   btnCloseSettings: $("btn-close-settings"),
   profileForm: $("profile-form"),
   profileSelectorDrawer: $("profile-selector-drawer"),
-  profileName: $("profile-name"),
-  profileProviderType: $("profile-provider-type"),
-  profileModel: $("profile-model"),
-  profileApiMode: $("profile-api-mode"),
   profileBaseUrl: $("profile-base-url"),
   profileApiKey: $("profile-api-key"),
   profileKeyHint: $("profile-key-hint"),
+  saveConnection: $("save-connection"),
+  discoverModels: $("discover-models"),
+  discoveredModelSection: $("discovered-model-section"),
+  discoveredModelSelector: $("discovered-model-selector"),
+  profileApiMode: $("profile-api-mode"),
+  addModel: $("add-model"),
+  activeModelSection: $("active-model-section"),
+  activeProfileModeHint: $("active-profile-mode-hint"),
   activateProfile: $("activate-profile"),
-  saveProfile: $("save-profile"),
-  newProfile: $("new-profile"),
+  testProfile: $("test-profile"),
   deleteProfile: $("delete-profile"),
+  connectionResult: $("connection-result"),
+  profileTestResult: $("profile-test-result"),
+  settingsEmptyState: $("settings-empty-state"),
 
   /* TOOLS 管理抽屉 */
   toolsOverlay: $("tools-overlay"),
@@ -101,8 +108,27 @@ const el = {
 const roleLabels = { assistant: "MzAgent", user: "你", system: "系统", tool: "TOOLS", mcp: "MCP" };
 const roleAvatarText = { assistant: "M", user: "你", system: "S", tool: "T", mcp: "M" };
 
-let profileState = { activeProfileName: null, defaultProfileName: null, profiles: [] };
+let profileState = {
+  activeProfileName: null,
+  profiles: [],
+  connection: null,
+  discoveredModels: [],
+};
 let isLoading = false;
+let activeAgentStream = null;
+let markdownReady = false;
+
+const markdownRoles = new Set(["assistant", "user"]);
+const apiModeLabels = {
+  "openai-responses": "OpenAI Responses · /v1/responses",
+  "openai-completions": "OpenAI Chat · /v1/chat/completions",
+  "anthropic-messages": "Anthropic Messages · /v1/messages",
+};
+const apiModeShortLabels = {
+  "openai-responses": "Responses",
+  "openai-completions": "Chat",
+  "anthropic-messages": "Messages",
+};
 
 /* ---------- 能力注册表状态 ---------- */
 /* TOOLS / MCP / SKILLS 各自维护一份 {items: [], masterEnabled: true} */
@@ -144,12 +170,132 @@ async function api(path, options = {}) {
   return data;
 }
 
-/* 预留：Agent SSE 实时流 */
-// function connectAgentStream(sessionId, onMessage) {
-//   const source = new EventSource(`/api/agent/stream?session_id=${sessionId}`);
-//   source.onmessage = (e) => onMessage(JSON.parse(e.data));
-//   return source;
-// }
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function normalizeCodeLanguage(language) {
+  const normalized = String(language || "").trim().toLowerCase();
+  if (!normalized) return "plaintext";
+  return normalized.replace(/[^a-z0-9_+-]/g, "") || "plaintext";
+}
+
+function safeParseJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function configureMarkdown() {
+  if (markdownReady || !window.marked) return;
+
+  const renderer = {
+    link({ href, title, tokens }) {
+      const text = this.parser.parseInline(tokens);
+      const target = href || "#";
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+      return `<a href="${escapeHtml(target)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`;
+    },
+    code({ text, lang }) {
+      const language = normalizeCodeLanguage(lang);
+      return `
+        <div class="message-code-block">
+          <button class="message-code-copy" type="button" aria-label="复制代码">复制</button>
+          <pre><code class="language-${language}">${escapeHtml(text)}</code></pre>
+        </div>
+      `;
+    },
+  };
+
+  window.marked.use({
+    gfm: true,
+    breaks: true,
+    renderer,
+  });
+
+  markdownReady = true;
+}
+
+function closeAgentStream() {
+  if (activeAgentStream) {
+    activeAgentStream.close();
+    activeAgentStream = null;
+  }
+}
+
+async function loadSessionSnapshotFromStream() {
+  if (typeof window.EventSource !== "function") {
+    throw new Error("当前浏览器不支持事件流。");
+  }
+
+  closeAgentStream();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let latestStatus = null;
+    let latestHistory = null;
+    const source = new EventSource(`/api/agent/stream?session_id=${encodeURIComponent(sessionId)}`);
+    activeAgentStream = source;
+
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      closeAgentStream();
+      resolve(payload);
+    };
+
+    const fail = (message) => {
+      if (settled) return;
+      settled = true;
+      closeAgentStream();
+      reject(new Error(message));
+    };
+
+    source.addEventListener("session_status", (event) => {
+      const payload = safeParseJson(event.data);
+      if (!payload) return;
+      latestStatus = payload;
+      updateStatusDot(payload.status_label);
+    });
+
+    source.addEventListener("session_history", (event) => {
+      const payload = safeParseJson(event.data);
+      if (!payload) return;
+      latestHistory = payload;
+      renderChatFlow(payload.history || []);
+    });
+
+    source.addEventListener("stream_end", () => {
+      finish({ status: latestStatus, history: latestHistory });
+    });
+
+    source.onerror = () => {
+      if (settled) return;
+      fail("会话事件流连接失败。");
+    };
+  });
+}
+
+async function loadSessionSnapshot() {
+  try {
+    return await loadSessionSnapshotFromStream();
+  } catch {
+    const [status, history] = await Promise.all([
+      api(`/api/session/${sessionId}/status`),
+      api(`/api/session/${sessionId}/history`),
+    ]);
+    updateStatusDot(status.status_label);
+    renderChatFlow(history.history || []);
+    return { status, history };
+  }
+}
 
 /* 预留：WebSocket 双向通信 */
 // function connectWebSocket(sessionId, handlers) {
@@ -171,10 +317,13 @@ function showToast(message, type = "info") {
 /* ---------- 加载态 ---------- */
 function setLoading(loading) {
   isLoading = loading;
-  el.submitButton.disabled = loading;
   el.refreshStatus.disabled = loading;
   el.resetSession.disabled = loading;
+  [el.saveConnection, el.discoverModels, el.addModel, el.activateProfile, el.testProfile, el.deleteProfile].forEach((button) => {
+    if (button) button.disabled = loading;
+  });
   el.thinkingIndicator.classList.toggle("hidden", !loading);
+  syncSettingsState();
 }
 
 /* ---------- 状态点 ---------- */
@@ -193,6 +342,10 @@ function updateStatusDot(statusLabel) {
 /* ---------- 表单校验 ---------- */
 function validateForm() {
   el.goalError.textContent = "";
+  if (!profileState.activeProfileName) {
+    el.goalError.textContent = "请先配置 NewAPI 连接并启用一个模型。";
+    return false;
+  }
   const goal = el.goal.value.trim();
   if (!goal) {
     el.goalError.textContent = "请先填写你想让我做什么。";
@@ -201,12 +354,140 @@ function validateForm() {
   return true;
 }
 
+function focusComposer() {
+  el.goal.focus();
+  const length = el.goal.value.length;
+  el.goal.setSelectionRange(length, length);
+}
+
+async function writeClipboard(text, successMessage) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(successMessage, "success");
+    return true;
+  } catch (err) {
+    showToast(`复制失败：${err.message}`, "error");
+    return false;
+  }
+}
+
+function renderMessageMarkdown(messageEl, content) {
+  const container = messageEl.querySelector(".message-content");
+  if (!window.marked || !window.DOMPurify) {
+    container.textContent = content || "";
+    return;
+  }
+
+  configureMarkdown();
+  const rawHtml = window.marked.parse(content || "");
+  container.innerHTML = window.DOMPurify.sanitize(rawHtml, {
+    ADD_ATTR: ["target", "rel", "class", "aria-label"],
+  });
+
+  container.querySelectorAll(".message-code-copy").forEach((button) => {
+    if (button.dataset.bound === "true") return;
+    button.dataset.bound = "true";
+    button.addEventListener("click", async () => {
+      const code = button.parentElement?.querySelector("code")?.textContent || "";
+      const copied = await writeClipboard(code, "代码已复制");
+      if (!copied) return;
+      const previous = button.textContent;
+      button.textContent = "已复制";
+      window.setTimeout(() => {
+        button.textContent = previous;
+      }, 1200);
+    });
+  });
+
+  if (window.hljs) {
+    container.querySelectorAll("pre code").forEach((node) => {
+      window.hljs.highlightElement(node);
+    });
+  }
+}
+
+function renderMessagePlainText(messageEl, content) {
+  messageEl.querySelector(".message-content").textContent = content || "";
+}
+
+function buildMessageActions(role, item) {
+  const buttons = [
+    `
+      <button class="message-action-btn" type="button" data-action="copy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        <span>复制</span>
+      </button>
+    `,
+  ];
+
+  if (role === "assistant" && item.round_id) {
+    buttons.push(`
+      <button class="message-action-btn" type="button" data-action="retry">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+        <span>重试</span>
+      </button>
+    `);
+  }
+
+  if (role === "user") {
+    buttons.push(`
+      <button class="message-action-btn ghost" type="button" data-action="edit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
+        <span>编辑</span>
+      </button>
+    `);
+  }
+
+  return `<div class="message-actions">${buttons.join("")}</div>`;
+}
+
+function bindMessageActions(messageEl, item) {
+  const copyButton = messageEl.querySelector('[data-action="copy"]');
+  if (copyButton) {
+    copyButton.addEventListener("click", async () => {
+      await writeClipboard(item.content || "", "消息已复制");
+    });
+  }
+
+  const retryButton = messageEl.querySelector('[data-action="retry"]');
+  if (retryButton) {
+    retryButton.addEventListener("click", async () => {
+      setLoading(true);
+      try {
+        const payload = await api(`/api/session/${sessionId}/rounds/${encodeURIComponent(item.round_id)}/retry`, {
+          method: "POST",
+        });
+        updateStatusDot(payload.status?.status_label);
+        renderChatFlow(payload.history || []);
+        showToast("已重新执行该轮次", "success");
+      } catch (err) {
+        showToast(err.message, "error");
+      } finally {
+        setLoading(false);
+      }
+    });
+  }
+
+  const editButton = messageEl.querySelector('[data-action="edit"]');
+  if (editButton) {
+    editButton.addEventListener("click", () => {
+      el.goal.value = item.content || "";
+      autoResizeTextarea();
+      focusComposer();
+      showToast("已回填到输入框，可修改后重新发送", "success");
+    });
+  }
+}
+
 /* ---------- 对话流渲染 ---------- */
 function createMessageEl(item, index) {
   const role = item.role || "unknown";
   const div = document.createElement("div");
   div.className = "message";
   div.dataset.role = role;
+  if (item.round_id) {
+    div.dataset.roundId = item.round_id;
+  }
 
   div.innerHTML = `
     <div class="message-avatar">${roleAvatarText[role] || "?"}</div>
@@ -216,9 +497,16 @@ function createMessageEl(item, index) {
         <span class="message-index">#${index + 1}</span>
       </div>
       <div class="message-content"></div>
+      ${buildMessageActions(role, item)}
     </div>
   `;
-  div.querySelector(".message-content").textContent = item.content || "";
+
+  if (markdownRoles.has(role)) {
+    renderMessageMarkdown(div, item.content || "");
+  } else {
+    renderMessagePlainText(div, item.content || "");
+  }
+  bindMessageActions(div, item);
   return div;
 }
 
@@ -251,88 +539,201 @@ function appendMessage(item, index) {
   });
 }
 
-/* ---------- 连接方案渲染 ---------- */
+/* ---------- 连接与模型渲染 ---------- */
 function renderProfileSelectors(payload) {
   profileState = {
     activeProfileName: payload.active_profile_name,
-    defaultProfileName: payload.default_profile_name,
     profiles: payload.profiles || [],
+    connection: payload.connection || null,
+    discoveredModels: profileState.discoveredModels || [],
   };
+  renderConnectionForm();
+  renderModelSelectors();
+  renderDiscoveredModels(profileState.discoveredModels);
+  syncSettingsState();
+  resetProfileTestResult();
+}
+
+function renderConnectionForm() {
+  const connection = profileState.connection || {};
+  el.profileBaseUrl.value = connection.base_url || "";
+  el.profileApiKey.value = "";
+  el.profileKeyHint.textContent = connection.api_key_masked
+    ? `当前已保存密钥：${connection.api_key_masked}，留空则继续沿用。`
+    : "请填写 NewAPI API Key，保存后即可获取模型列表。";
+}
+
+function getApiModeLabel(apiMode) {
+  return apiModeLabels[apiMode] || apiMode;
+}
+
+function getApiModeShortLabel(apiMode) {
+  return apiModeShortLabels[apiMode] || apiMode;
+}
+
+function getProfileByName(profileName) {
+  return profileState.profiles.find((profile) => profile.profile_name === profileName) || null;
+}
+
+function renderModelSelectors() {
+  const hasProfiles = profileState.profiles.length > 0;
+  const activeName = profileState.activeProfileName;
 
   [el.profileSelector, el.profileSelectorDrawer].forEach((select) => {
     select.innerHTML = "";
-    profileState.profiles.forEach((p) => {
-      const opt = document.createElement("option");
-      opt.value = p.profile_name;
-      const label = p.profile_name;
-      opt.textContent = p.is_default ? `${label} · 当前` : label;
-      select.appendChild(opt);
+    if (!hasProfiles) {
+      select.disabled = true;
+      select.value = "";
+      return;
+    }
+
+    profileState.profiles.forEach((profile) => {
+      const option = document.createElement("option");
+      option.value = profile.profile_name;
+      option.textContent = profile.is_active
+        ? `${profile.display_name} · ${getApiModeShortLabel(profile.api_mode)} · 已启用`
+        : `${profile.display_name} · ${getApiModeShortLabel(profile.api_mode)}`;
+      select.appendChild(option);
     });
-    const active = profileState.activeProfileName || profileState.defaultProfileName;
-    if (active) select.value = active;
+    select.disabled = false;
+    select.value = activeName || profileState.profiles[0].profile_name;
   });
 
-  loadProfileIntoForm(profileState.activeProfileName || profileState.defaultProfileName);
+  syncActiveProfileModeHint();
 }
 
-function loadProfileIntoForm(name) {
-  const p = profileState.profiles.find((x) => x.profile_name === name);
-  if (!p) return;
-  el.profileName.value = p.profile_name;
-  el.profileProviderType.value = p.provider_type;
-  el.profileModel.value = p.default_model || "";
-  el.profileBaseUrl.value = p.base_url || "";
-  el.profileApiKey.value = "";
-  el.profileApiMode.value = p.api_mode || "responses";
-  el.profileKeyHint.textContent = p.api_key_masked
-    ? `该方案已保存密钥：${p.api_key_masked}`
-    : "该方案尚未配置密钥，请填写后保存。";
+function renderDiscoveredModels(models) {
+  profileState.discoveredModels = Array.isArray(models) ? [...models] : [];
+  el.discoveredModelSelector.innerHTML = "";
+  if (!profileState.discoveredModels.length) {
+    el.discoveredModelSelector.disabled = true;
+    el.discoveredModelSelector.value = "";
+    return;
+  }
+
+  profileState.discoveredModels.forEach((modelName) => {
+    const option = document.createElement("option");
+    option.value = modelName;
+    option.textContent = modelName;
+    el.discoveredModelSelector.appendChild(option);
+  });
+  el.discoveredModelSelector.disabled = false;
 }
 
-function clearProfileForm() {
-  el.profileName.value = "";
-  el.profileProviderType.value = "openai_compatible_proxy";
-  el.profileModel.value = "";
-  el.profileBaseUrl.value = "";
-  el.profileApiKey.value = "";
-  el.profileApiMode.value = "responses";
-  el.profileKeyHint.textContent = "新方案需要单独配置密钥，保存后即可切换使用。";
+function syncComposerAvailability() {
+  el.submitButton.disabled = isLoading || !profileState.activeProfileName;
+}
+
+function syncActiveProfileModeHint() {
+  const selectedProfileName = el.profileSelectorDrawer.value || profileState.activeProfileName;
+  const profile = getProfileByName(selectedProfileName);
+  if (!profile) {
+    el.activeProfileModeHint.textContent = "当前模型的请求协议会在这里显示。";
+    return;
+  }
+  el.activeProfileModeHint.textContent = `当前协议：${getApiModeLabel(profile.api_mode)}`;
+}
+
+function syncSettingsState() {
+  const connectionConfigured = Boolean(profileState.connection?.is_configured);
+  const hasProfiles = profileState.profiles.length > 0;
+  const hasDiscoveredModels = profileState.discoveredModels.length > 0;
+  const selectedProfileName = el.profileSelectorDrawer.value || profileState.activeProfileName;
+  const hasSelectedProfile = Boolean(selectedProfileName);
+  const hasSelectedApiMode = Boolean(el.profileApiMode.value);
+
+  el.profileSelectorWrap.classList.toggle("hidden", !hasProfiles);
+  el.activeModelSection.classList.toggle("hidden", !hasProfiles);
+  el.discoveredModelSection.classList.toggle("hidden", !hasDiscoveredModels);
+
+  el.discoverModels.disabled = isLoading || !connectionConfigured;
+  el.profileApiMode.disabled = isLoading || !connectionConfigured || !hasDiscoveredModels;
+  el.addModel.disabled = isLoading || !connectionConfigured || !hasDiscoveredModels || !hasSelectedApiMode;
+  el.activateProfile.disabled = isLoading || !hasSelectedProfile;
+  el.testProfile.disabled = isLoading || !hasSelectedProfile;
+  el.deleteProfile.disabled = isLoading || !hasSelectedProfile;
+
+  if (!connectionConfigured && !hasProfiles) {
+    el.settingsEmptyState.textContent = "当前无配置方案";
+    el.settingsEmptyState.classList.remove("hidden");
+  } else if (connectionConfigured && !hasProfiles && !hasDiscoveredModels) {
+    el.settingsEmptyState.textContent = "当前已保存连接，但还没有添加模型。";
+    el.settingsEmptyState.classList.remove("hidden");
+  } else {
+    el.settingsEmptyState.classList.add("hidden");
+  }
+
+  syncActiveProfileModeHint();
+  syncComposerAvailability();
+}
+
+function buildConnectionPayload() {
+  return {
+    base_url: el.profileBaseUrl.value.trim(),
+    api_key: el.profileApiKey.value.trim() || null,
+    timeout: 60,
+  };
 }
 
 function buildProfilePayload() {
-  const name = el.profileName.value.trim();
+  const modelName = el.discoveredModelSelector.value;
   return {
-    profile_name: name,
-    display_name: name,
-    provider_type: el.profileProviderType.value,
-    default_model: el.profileModel.value.trim() || null,
-    base_url: el.profileBaseUrl.value.trim() || null,
-    api_key: el.profileApiKey.value.trim() || null,
+    profile_name: modelName,
+    display_name: modelName,
+    model_name: modelName,
     api_mode: el.profileApiMode.value,
-    timeout: 60,
     extra_headers: {},
     enabled_capabilities: [],
   };
 }
 
+function resetConnectionResult() {
+  el.connectionResult.textContent = "";
+  el.connectionResult.className = "profile-test-result hidden";
+}
+
+function resetProfileTestResult() {
+  el.profileTestResult.textContent = "";
+  el.profileTestResult.className = "profile-test-result hidden";
+}
+
+function renderConnectionResult(message, ok = true) {
+  el.connectionResult.textContent = message;
+  el.connectionResult.className = `profile-test-result ${ok ? "success" : "error"}`;
+}
+
+function renderProfileTestResult(payload) {
+  const lines = [payload.message || "连接测试已完成。"];
+  if (payload.model) {
+    lines.push(`模型：${payload.model}`);
+  }
+  if (payload.api_mode) {
+    lines.push(`协议：${getApiModeLabel(payload.api_mode)}`);
+  }
+  if (payload.latency_ms) {
+    lines.push(`耗时：${payload.latency_ms} ms`);
+  }
+  if (payload.output_text) {
+    lines.push(`返回：${payload.output_text}`);
+  }
+  el.profileTestResult.textContent = lines.join("\n");
+  el.profileTestResult.className = `profile-test-result ${payload.ok ? "success" : "error"}`;
+}
+
 /* ---------- 数据刷新 ---------- */
 async function refreshAll() {
-  const [status, history, profiles] = await Promise.all([
-    api(`/api/session/${sessionId}/status`),
-    api(`/api/session/${sessionId}/history`),
+  const [, profiles] = await Promise.all([
+    loadSessionSnapshot(),
     api("/api/llm/profiles"),
+    refreshCapabilities(),
   ]);
-  updateStatusDot(status.status_label);
-  renderChatFlow(history.history || []);
   renderProfileSelectors(profiles);
 
-  /* 尝试刷新能力注册表（后端如尚未实现则静默跳过） */
-  refreshCapabilities();
+  /* refreshCapabilities 已在 Promise.all 中完成 */
 }
 
 /* ---------- 能力注册表刷新 ---------- */
 async function refreshCapabilities() {
-  /* 预留 API：GET /api/capabilities/{type} → { items: [{ name, description, enabled }] } */
   const types = ["tool", "mcp", "skill"];
   for (const type of types) {
     try {
@@ -341,6 +742,10 @@ async function refreshCapabilities() {
         name: it.name,
         description: it.description || "",
         enabled: it.enabled !== false,
+        endpoint: it.endpoint || "",
+        transport: it.transport || "",
+        command: it.command || "",
+        entry: it.entry || "",
       }));
     } catch {
       /* 后端尚未实现此接口，保持空列表 */
@@ -380,6 +785,13 @@ function renderCapDrawer(type) {
 
   dom.list.innerHTML = "";
   state.items.forEach((item, idx) => {
+    const meta = [
+      item.description,
+      item.endpoint ? `调用地址：${item.endpoint}` : "",
+      item.transport ? `传输方式：${item.transport}` : "",
+      item.command ? `启动命令：${item.command}` : "",
+      item.entry ? `入口路径：${item.entry}` : "",
+    ].filter(Boolean);
     const div = document.createElement("div");
     div.className = `cap-item${item.enabled ? " enabled" : ""}`;
     const switchId = `${type}-switch-${idx}`;
@@ -392,8 +804,8 @@ function renderCapDrawer(type) {
         </svg>
       </div>
       <div class="cap-item-info">
-        <div class="cap-item-name">${item.name}</div>
-        <div class="cap-item-desc">${item.description}</div>
+        <div class="cap-item-name">${escapeHtml(item.name)}</div>
+        <div class="cap-item-desc">${meta.map((line) => `<div class="cap-item-meta">${escapeHtml(line)}</div>`).join("")}</div>
       </div>
       <div class="cap-item-switch">
         <input type="checkbox" id="${switchId}" ${item.enabled ? "checked" : ""} />
@@ -405,11 +817,30 @@ function renderCapDrawer(type) {
     `;
     /* 子项开关事件 */
     const checkbox = div.querySelector("input");
-    checkbox.addEventListener("change", () => {
+    checkbox.addEventListener("change", async () => {
+      const previous = item.enabled;
       item.enabled = checkbox.checked;
       div.classList.toggle("enabled", checkbox.checked);
       renderCapDrawer(type);
-      /* 预留：通知后端 POST /api/capabilities/{type}/{name}/toggle */
+      try {
+        const data = await api(`/api/capabilities/${type}/${encodeURIComponent(item.name)}/toggle`, {
+          method: "POST",
+        });
+        capState[type].items = (data.items || []).map((capability) => ({
+          name: capability.name,
+          description: capability.description || "",
+          enabled: capability.enabled !== false,
+          endpoint: capability.endpoint || "",
+          transport: capability.transport || "",
+          command: capability.command || "",
+          entry: capability.entry || "",
+        }));
+        renderCapDrawer(type);
+      } catch (err) {
+        item.enabled = previous;
+        renderCapDrawer(type);
+        showToast(err.message, "error");
+      }
     });
     /* 删除按钮事件 */
     div.querySelector(".cap-item-delete").addEventListener("click", async () => {
@@ -494,7 +925,7 @@ async function removeCapItem(type, idx) {
 
   /* 尝试通知后端 */
   try {
-    await api(`/api/capabilities/${type}/${item.name}`, { method: "DELETE" });
+    await api(`/api/capabilities/${type}/${encodeURIComponent(item.name)}`, { method: "DELETE" });
   } catch {
     /* 后端尚未实现，仅前端本地删除 */
   }
@@ -613,7 +1044,7 @@ el.roundForm.addEventListener("submit", async (e) => {
         goal: el.goal.value.trim(),
         action_type: actionType,
         target: null,
-        profile_name: el.profileSelector.value || null,
+        profile_name: profileState.activeProfileName,
         enabled_capabilities: enabledCaps,
         /* 各能力类型的细粒度启用列表 */
         enabled_tools: capState.tool.masterEnabled
@@ -681,66 +1112,162 @@ el.settingsOverlay.addEventListener("click", closeSettings);
 el.btnCloseSettings.addEventListener("click", closeSettings);
 
 /* 顶栏方案选择器同步到抽屉 */
-el.profileSelector.addEventListener("change", () => {
-  el.profileSelectorDrawer.value = el.profileSelector.value;
-  loadProfileIntoForm(el.profileSelector.value);
-});
-
 el.profileSelectorDrawer.addEventListener("change", () => {
-  el.profileSelector.value = el.profileSelectorDrawer.value;
-  loadProfileIntoForm(el.profileSelectorDrawer.value);
+  resetProfileTestResult();
+  syncSettingsState();
 });
 
-/* 方案保存 */
-el.profileForm.addEventListener("submit", async (e) => {
+el.profileApiMode.addEventListener("change", () => {
+  syncSettingsState();
+});
+
+el.profileForm.addEventListener("submit", (e) => {
   e.preventDefault();
-  const payload = buildProfilePayload();
-  if (!payload.profile_name) { showToast("请先填写方案名", "error"); return; }
-  const exists = profileState.profiles.some((p) => p.profile_name === payload.profile_name);
-  const method = exists ? "PUT" : "POST";
-  const path = exists ? `/api/llm/profiles/${payload.profile_name}` : "/api/llm/profiles";
+});
+
+async function activateProfileByName(name, successMessage = "已启用模型") {
+  if (!name) {
+    showToast("当前没有可启用的模型", "error");
+    return;
+  }
   setLoading(true);
   try {
-    const resp = await api(path, {
-      method,
+    const resp = await api(`/api/llm/profiles/${name}/activate`, { method: "POST" });
+    renderProfileSelectors(resp.profiles);
+    showToast(resp.message || successMessage, "success");
+  } catch (err) { showToast(err.message, "error"); }
+  finally { setLoading(false); }
+}
+
+el.profileSelector.addEventListener("change", async () => {
+  const name = el.profileSelector.value;
+  if (!name || name === profileState.activeProfileName) return;
+  await activateProfileByName(name);
+});
+
+/* 保存连接 */
+el.saveConnection.addEventListener("click", async () => {
+  const payload = buildConnectionPayload();
+  if (!payload.base_url) {
+    showToast("请先填写 NewAPI base_url", "error");
+    return;
+  }
+  setLoading(true);
+  resetConnectionResult();
+  try {
+    const resp = await api("/api/llm/connection", {
+      method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
     renderProfileSelectors(resp.profiles);
-    el.profileSelector.value = payload.profile_name;
+    renderDiscoveredModels([]);
+    syncSettingsState();
+    renderConnectionResult(resp.message || "连接配置已保存", true);
+    showToast(resp.message || "连接配置已保存", "success");
+  } catch (err) {
+    renderConnectionResult(err.message || "连接配置保存失败", false);
+    showToast(err.message, "error");
+  } finally {
+    setLoading(false);
+  }
+});
+
+/* 获取模型 */
+el.discoverModels.addEventListener("click", async () => {
+  setLoading(true);
+  resetConnectionResult();
+  try {
+    const resp = await api("/api/llm/connection/models", { method: "POST" });
+    renderDiscoveredModels(resp.models || []);
+    syncSettingsState();
+    renderConnectionResult(resp.message || "模型列表已更新", true);
+    showToast(resp.message || "模型列表已更新", "success");
+  } catch (err) {
+    renderDiscoveredModels([]);
+    syncSettingsState();
+    renderConnectionResult(err.message || "模型获取失败", false);
+    showToast(err.message, "error");
+  } finally {
+    setLoading(false);
+  }
+});
+
+/* 添加模型 */
+el.addModel.addEventListener("click", async () => {
+  const payload = buildProfilePayload();
+  if (!payload.model_name) {
+    showToast("请先从站点列表中选择一个模型", "error");
+    return;
+  }
+  if (!payload.api_mode) {
+    showToast("请先选择模型的请求协议", "error");
+    return;
+  }
+  setLoading(true);
+  try {
+    const resp = await api("/api/llm/profiles", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    renderProfileSelectors(resp.profiles);
     el.profileSelectorDrawer.value = payload.profile_name;
-    loadProfileIntoForm(payload.profile_name);
-    showToast(resp.message || "方案已保存", "success");
-  } catch (err) { showToast(err.message, "error"); }
-  finally { setLoading(false); }
+    syncSettingsState();
+    showToast(resp.message || "模型已添加", "success");
+  } catch (err) {
+    showToast(err.message, "error");
+  } finally {
+    setLoading(false);
+  }
 });
 
 /* 设为当前 */
 el.activateProfile.addEventListener("click", async () => {
   const name = el.profileSelectorDrawer.value;
-  if (!name) { showToast("当前没有可切换的连接方案", "error"); return; }
-  setLoading(true);
-  try {
-    const resp = await api(`/api/llm/profiles/${name}/activate`, { method: "POST" });
-    renderProfileSelectors(resp.profiles);
-    showToast(resp.message || "已切换", "success");
-  } catch (err) { showToast(err.message, "error"); }
-  finally { setLoading(false); }
+  await activateProfileByName(name);
 });
 
-/* 新建方案 */
-el.newProfile.addEventListener("click", clearProfileForm);
+/* 测试当前方案连接 */
+el.testProfile.addEventListener("click", async () => {
+  const name = el.profileSelectorDrawer.value;
+  if (!name) {
+    showToast("当前没有可测试的模型", "error");
+    return;
+  }
+
+  setLoading(true);
+  resetProfileTestResult();
+  try {
+    const resp = await api(`/api/llm/profiles/${encodeURIComponent(name)}/test`, { method: "POST" });
+    renderProfileTestResult(resp);
+    showToast(resp.ok ? "连接测试成功" : "连接测试失败", resp.ok ? "success" : "error");
+  } catch (err) {
+    renderProfileTestResult({
+      ok: false,
+      message: err.message || "连接测试失败",
+      model: null,
+      api_mode: null,
+      latency_ms: 0,
+      output_text: null,
+    });
+    showToast(err.message, "error");
+  } finally {
+    setLoading(false);
+  }
+});
 
 /* 删除方案 */
 el.deleteProfile.addEventListener("click", async () => {
   const name = el.profileSelectorDrawer.value;
-  if (!name) { showToast("当前没有可删除的连接方案", "error"); return; }
-  if (!window.confirm(`确定要删除连接方案 ${name} 吗？`)) return;
+  if (!name) { showToast("当前没有可删除的模型", "error"); return; }
+  if (!window.confirm(`确定要删除模型 ${name} 吗？`)) return;
   setLoading(true);
   try {
     const resp = await api(`/api/llm/profiles/${name}`, { method: "DELETE" });
     renderProfileSelectors(resp.profiles);
-    showToast(resp.message || "方案已删除", "success");
+    resetProfileTestResult();
+    showToast(resp.message || "模型已删除", "success");
   } catch (err) { showToast(err.message, "error"); }
   finally { setLoading(false); }
 });

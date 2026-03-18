@@ -6,8 +6,9 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from .llm_profiles import (
+    DEFAULT_API_MODE,
+    LLMConnection,
     LLMProfile,
-    ProfileProviderType,
     load_profile_store,
 )
 
@@ -21,34 +22,33 @@ class LLMSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile_name: str | None = None
-    provider_type: ProfileProviderType = "openai_native"
     model_id: str | None = None
     api_key: str | None = None
     base_url: str | None = None
-    api_mode: str = "responses"
+    api_mode: str = DEFAULT_API_MODE
     extra_headers: dict[str, str] = Field(default_factory=dict)
     enabled_capabilities: list[str] = Field(default_factory=list)
     timeout: int = Field(default=60, ge=1)
 
     def is_configured(self) -> bool:
-        if not self.model_id or not self.api_key:
-            return False
-        if self.provider_type == "openai_native":
-            return True
-        return bool(self.base_url)
+        return bool(self.model_id and self.api_key and self.base_url)
 
     @classmethod
-    def from_profile(cls, profile: LLMProfile) -> "LLMSettings":
+    def from_profile(
+        cls,
+        *,
+        profile: LLMProfile,
+        connection: LLMConnection,
+    ) -> "LLMSettings":
         return cls(
             profile_name=profile.profile_name,
-            provider_type=profile.provider_type,
-            model_id=profile.default_model,
-            api_key=profile.api_key,
-            base_url=profile.base_url,
+            model_id=profile.model_name,
+            api_key=connection.api_key,
+            base_url=connection.base_url,
             api_mode=profile.api_mode,
             extra_headers=dict(profile.extra_headers),
             enabled_capabilities=list(profile.enabled_capabilities),
-            timeout=profile.timeout,
+            timeout=connection.timeout,
         )
 
 
@@ -68,7 +68,7 @@ class RuntimeSettings(BaseModel):
 
     project_root: Path
     llm: LLMSettings
-    default_profile_name: str | None = None
+    active_profile_name: str | None = None
     llm_profiles: dict[str, LLMProfile] = Field(default_factory=dict)
     mcp_servers: dict[str, MCPServerSettings] = Field(default_factory=dict)
 
@@ -79,18 +79,24 @@ def load_runtime_settings(
     profile_name: str | None = None,
 ) -> RuntimeSettings:
     root = discover_project_root(project_root)
-    env_values = load_env_file(root / ".env")
-    profile_store = load_profile_store(project_root=root, env_values=env_values)
-    selected_profile_name = profile_name or profile_store.default_profile_name
+    profile_store = load_profile_store(project_root=root)
+    selected_profile_name = profile_name or profile_store.resolve_active_profile_name()
+    if not selected_profile_name:
+        raise ValueError("当前无配置方案，请先配置 NewAPI 连接并添加模型。")
+    if profile_store.connection is None or not profile_store.connection.is_configured():
+        raise ValueError("当前未配置 NewAPI 连接，请先填写 base_url 与 api_key。")
     selected_profile = profile_store.require(selected_profile_name)
-    llm = LLMSettings.from_profile(selected_profile)
+    llm = LLMSettings.from_profile(
+        profile=selected_profile,
+        connection=profile_store.connection,
+    )
 
     pyproject_data = load_pyproject(root / "pyproject.toml")
     mcp_servers = parse_mcp_servers(pyproject_data)
     return RuntimeSettings(
         project_root=root,
         llm=llm,
-        default_profile_name=profile_store.default_profile_name,
+        active_profile_name=profile_store.resolve_active_profile_name(),
         llm_profiles=profile_store.profile_map(),
         mcp_servers=mcp_servers,
     )
@@ -118,23 +124,6 @@ def discover_project_root(project_root: str | Path | None = None) -> Path:
             candidate = candidate.parent
 
     raise FileNotFoundError("未找到 MzAgentSub 项目根目录。")
-
-
-def load_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        value = raw_value.strip().strip('"').strip("'")
-        values[key] = value
-    return values
-
 
 def load_pyproject(path: Path) -> dict[str, object]:
     if not path.exists():

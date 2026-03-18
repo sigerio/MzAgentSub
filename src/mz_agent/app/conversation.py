@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..adapters import LLMAdapter
 from ..capabilities import (
     CapabilityItem,
     CapabilityRegistry,
@@ -17,7 +21,14 @@ from ..capabilities import (
 )
 from ..contracts.context import ContextSnapshot
 from ..contracts.state import ReactStatus
-from ..llm_profiles import LLMProfile, LLMProfileStore, load_profile_store, save_profile_store
+from ..llm_profiles import (
+    DEFAULT_API_MODE,
+    LLMConnection,
+    LLMProfile,
+    LLMProfileStore,
+    load_profile_store,
+    save_profile_store,
+)
 from ..orchestration import FileBackedSTM, Pipeline, PipelineRoundResult
 from .runtime import RuntimeOptions, build_runtime, render_round_result, run_single_round
 
@@ -123,30 +134,42 @@ class CapabilityMutationResponse(BaseModel):
     items: list[CapabilityItem] = Field(default_factory=list)
 
 
+class ConnectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    api_key: str | None = None
+    timeout: int = Field(default=60, ge=1)
+
+
+class ConnectionView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str | None = None
+    api_key_masked: str | None = None
+    timeout: int = Field(default=60, ge=1)
+    is_configured: bool = False
+
+
 class ProfilePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    profile_name: str
+    model_name: str
+    api_mode: str = DEFAULT_API_MODE
+    profile_name: str | None = None
     display_name: str | None = None
-    provider_type: str
-    default_model: str | None = None
-    api_key: str | None = None
-    base_url: str | None = None
-    api_mode: str = "responses"
-    timeout: int = Field(default=60, ge=1)
     extra_headers: dict[str, str] = Field(default_factory=dict)
     enabled_capabilities: list[str] = Field(default_factory=list)
 
     def to_profile(self) -> LLMProfile:
+        normalized_model_name = self.model_name.strip()
+        profile_name = (self.profile_name or normalized_model_name).strip()
+        display_name = (self.display_name or normalized_model_name).strip()
         return LLMProfile(
-            profile_name=self.profile_name,
-            display_name=self.display_name,
-            provider_type=self.provider_type,  # type: ignore[arg-type]
-            default_model=self.default_model,
-            api_key=self.api_key,
-            base_url=self.base_url,
+            profile_name=profile_name,
+            display_name=display_name,
+            model_name=normalized_model_name,
             api_mode=self.api_mode,
-            timeout=self.timeout,
             extra_headers=dict(self.extra_headers),
             enabled_capabilities=list(self.enabled_capabilities),
         )
@@ -157,22 +180,18 @@ class ProfileView(BaseModel):
 
     profile_name: str
     display_name: str
-    provider_type: str
-    default_model: str | None = None
-    api_key_masked: str | None = None
-    base_url: str | None = None
-    api_mode: str
-    timeout: int
+    model_name: str
+    api_mode: str = DEFAULT_API_MODE
     extra_headers: dict[str, str] = Field(default_factory=dict)
     enabled_capabilities: list[str] = Field(default_factory=list)
-    is_default: bool = False
+    is_active: bool = False
 
 
 class ProfileListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    default_profile_name: str
-    active_profile_name: str
+    connection: ConnectionView = Field(default_factory=ConnectionView)
+    active_profile_name: str | None = None
     profiles: list[ProfileView] = Field(default_factory=list)
 
 
@@ -181,6 +200,26 @@ class ProfileMutationResponse(BaseModel):
 
     message: str
     profiles: ProfileListResponse
+
+
+class ModelDiscoverResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    models: list[str] = Field(default_factory=list)
+
+
+class ProfileConnectionTestResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_name: str
+    ok: bool
+    message: str
+    error_code: str | None = None
+    model: str | None = None
+    api_mode: str = DEFAULT_API_MODE
+    latency_ms: int = Field(default=0, ge=0)
+    output_text: str | None = None
 
 
 class ConversationService:
@@ -276,7 +315,7 @@ class ConversationService:
         return build_session_status(
             session_id=self.session_id,
             snapshot=snapshot,
-            active_profile_name=self._load_profile_store().default_profile_name,
+            active_profile_name=self._load_profile_store().resolve_active_profile_name(),
             result_profile_name=derive_result_profile_name(snapshot=snapshot),
             result_type=derive_result_type_from_snapshot(snapshot=snapshot),
             result_text=derive_result_text_from_snapshot(snapshot=snapshot),
@@ -295,6 +334,40 @@ class ConversationService:
     def list_profiles(self) -> ProfileListResponse:
         store = self._load_profile_store()
         return self._build_profile_list_response(store=store)
+
+    def save_connection(self, *, payload: ConnectionPayload) -> ProfileMutationResponse:
+        base_url = _normalize_base_url(payload.base_url)
+        store = self._load_profile_store()
+        existing_connection = store.connection or LLMConnection()
+        api_key = (payload.api_key or "").strip() or existing_connection.api_key
+        if not api_key:
+            raise ValueError("请先填写 NewAPI API Key。")
+
+        connection = LLMConnection(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=payload.timeout,
+        )
+        store = store.set_connection(connection)
+        save_profile_store(project_root=self._project_root, store=store)
+        return ProfileMutationResponse(
+            message="已保存 NewAPI 连接配置。",
+            profiles=self._build_profile_list_response(store=store),
+        )
+
+    def discover_connection_models(self) -> ModelDiscoverResponse:
+        store = self._load_profile_store()
+        connection = self._require_connection(store=store)
+        models = self._fetch_connection_model_names(connection=connection)
+        if not models:
+            return ModelDiscoverResponse(
+                message="当前站点未返回可用模型。",
+                models=[],
+            )
+        return ModelDiscoverResponse(
+            message=f"已获取 {len(models)} 个可用模型。",
+            models=models,
+        )
 
     def list_capabilities(self, *, capability_type: CapabilityType) -> CapabilityListResponse:
         registry = self._load_capability_registry()
@@ -356,18 +429,17 @@ class ConversationService:
         )
 
     def save_profile(self, *, payload: ProfilePayload) -> ProfileMutationResponse:
-        if payload.base_url and not payload.base_url.startswith(("https://", "http://")):
-            raise ValueError("base_url 必须以 http:// 或 https:// 开头。")
-
         store = self._load_profile_store()
-        existing = store.get(payload.profile_name)
+        self._require_connection(store=store)
         profile = payload.to_profile()
-        if existing is not None and not profile.api_key:
-            profile = profile.model_copy(update={"api_key": existing.api_key})
+        if not profile.model_name:
+            raise ValueError("请先选择要添加的模型。")
+
+        existing = store.get(profile.profile_name)
         store = store.upsert(profile)
         save_profile_store(project_root=self._project_root, store=store)
         return ProfileMutationResponse(
-            message=f"已保存配置方案：{profile.profile_name}",
+            message=f"已{'更新' if existing is not None else '添加'}模型：{profile.profile_name}",
             profiles=self._build_profile_list_response(store=store),
         )
 
@@ -375,7 +447,7 @@ class ConversationService:
         store = self._load_profile_store().delete(profile_name)
         save_profile_store(project_root=self._project_root, store=store)
         return ProfileMutationResponse(
-            message=f"已删除配置方案：{profile_name}",
+            message=f"已删除模型：{profile_name}",
             profiles=self._build_profile_list_response(store=store),
         )
 
@@ -383,8 +455,69 @@ class ConversationService:
         store = self._load_profile_store().activate(profile_name)
         save_profile_store(project_root=self._project_root, store=store)
         return ProfileMutationResponse(
-            message=f"已切换当前配置方案：{profile_name}",
+            message=f"已启用模型：{profile_name}",
             profiles=self._build_profile_list_response(store=store),
+        )
+
+    def test_profile_connection(self, *, profile_name: str) -> ProfileConnectionTestResponse:
+        store = self._load_profile_store()
+        profile = store.require(profile_name)
+        connection = store.connection
+        if connection is None or not connection.api_key:
+            return ProfileConnectionTestResponse(
+                profile_name=profile_name,
+                ok=False,
+                message="当前未配置 NewAPI API Key，请先保存连接配置。",
+                error_code="missing_api_key",
+                model=profile.model_name,
+                api_mode=profile.api_mode,
+            )
+        if not connection.base_url:
+            return ProfileConnectionTestResponse(
+                profile_name=profile_name,
+                ok=False,
+                message="当前未配置 NewAPI base_url，请先保存连接配置。",
+                error_code="missing_base_url",
+                model=profile.model_name,
+                api_mode=profile.api_mode,
+            )
+
+        timeout_ms = min(connection.timeout, 15) * 1000
+        adapter = LLMAdapter(project_root=self._project_root, live_mode=True)
+
+        try:
+            response = adapter.test_connection(
+                profile_name=profile_name,
+                timeout_ms=timeout_ms,
+            )
+        except ModuleNotFoundError:
+            return ProfileConnectionTestResponse(
+                profile_name=profile_name,
+                ok=False,
+                message="当前环境未安装 openai 依赖，无法执行连接测试。",
+                error_code="missing_dependency",
+                model=profile.model_name,
+                api_mode=profile.api_mode,
+            )
+        except Exception as exc:
+            return self._build_profile_connection_failure_response(
+                profile=profile,
+                exc=exc,
+            )
+
+        output_text = "\n".join(
+            block.content
+            for block in response.content_blocks
+            if block.type == "text" and block.content
+        ).strip() or None
+        return ProfileConnectionTestResponse(
+            profile_name=profile_name,
+            ok=True,
+            message=f"连接测试成功：{profile_name}",
+            model=response.provider_trace.model if response.provider_trace else profile.model_name,
+            api_mode=response.provider_trace.api_mode if response.provider_trace else profile.api_mode,
+            latency_ms=response.latency_ms,
+            output_text=output_text,
         )
 
     def _load_profile_store(self) -> LLMProfileStore:
@@ -393,34 +526,148 @@ class ConversationService:
     def _load_capability_registry(self) -> CapabilityRegistry:
         return load_capability_registry(project_root=self._project_root)
 
+    @staticmethod
+    def _require_connection(*, store: LLMProfileStore) -> LLMConnection:
+        connection = store.connection
+        if connection is None or not connection.is_configured():
+            raise ValueError("当前未配置 NewAPI 连接，请先填写 base_url 与 api_key。")
+        return connection
+
+    @staticmethod
+    def _build_profile_connection_failure_response(
+        *,
+        profile: LLMProfile,
+        exc: Exception,
+    ) -> ProfileConnectionTestResponse:
+        try:
+            import openai
+        except ModuleNotFoundError:
+            openai = None  # type: ignore[assignment]
+
+        from ..adapters.llm import ProviderRequestError
+
+        message = f"连接测试失败：{exc}"
+        error_code = "unknown_error"
+
+        if isinstance(exc, ProviderRequestError):
+            if exc.status_code == 400:
+                message = "请求参数无效，请检查当前方案的模型名、接口模式或代理兼容性。"
+                error_code = "bad_request"
+            elif exc.status_code == 401:
+                message = "认证失败，请检查当前方案的 API Key 是否正确。"
+                error_code = "authentication_failed"
+            elif exc.status_code == 403:
+                message = "当前方案无权限访问该模型或接口。"
+                error_code = "permission_denied"
+            elif exc.status_code == 404:
+                message = "未找到目标模型或接口地址，请检查模型名与 base_url。"
+                error_code = "not_found"
+            elif exc.status_code == 429:
+                message = "请求已被限流，请稍后再试。"
+                error_code = "rate_limited"
+            elif exc.status_code is not None:
+                message = f"接口返回异常状态：{exc.status_code}"
+                error_code = "api_status_error"
+            else:
+                message = str(exc)
+                error_code = "connection_failed"
+        elif openai is not None:
+            if isinstance(exc, openai.APITimeoutError):
+                message = "连接测试超时，请检查网络、接口地址或服务端响应速度。"
+                error_code = "timeout"
+            elif isinstance(exc, openai.AuthenticationError):
+                message = "认证失败，请检查当前方案的 API Key 是否正确。"
+                error_code = "authentication_failed"
+            elif isinstance(exc, openai.PermissionDeniedError):
+                message = "当前方案无权限访问该模型或接口。"
+                error_code = "permission_denied"
+            elif isinstance(exc, openai.NotFoundError):
+                message = "未找到目标模型或接口地址，请检查模型名与 base_url。"
+                error_code = "not_found"
+            elif isinstance(exc, openai.RateLimitError):
+                message = "请求已被限流，请稍后再试。"
+                error_code = "rate_limited"
+            elif isinstance(exc, openai.BadRequestError):
+                message = "请求参数无效，请检查当前方案的模型名、接口模式或代理兼容性。"
+                error_code = "bad_request"
+            elif isinstance(exc, openai.InternalServerError):
+                message = "目标服务内部错误，请稍后再试。"
+                error_code = "internal_server_error"
+            elif isinstance(exc, openai.APIConnectionError):
+                message = "连接失败，请检查网络连通性、接口地址和代理服务状态。"
+                error_code = "connection_failed"
+            elif isinstance(exc, openai.APIStatusError):
+                status_code = getattr(exc, "status_code", None)
+                message = f"接口返回异常状态：{status_code}"
+                error_code = "api_status_error"
+
+        return ProfileConnectionTestResponse(
+            profile_name=profile.profile_name,
+            ok=False,
+            message=message,
+            error_code=error_code,
+            model=profile.model_name,
+            api_mode=profile.api_mode,
+        )
+
     def _resolve_effective_profile_name(self, *, requested_profile_name: str | None) -> str:
         store = self._load_profile_store()
         if requested_profile_name:
             store.require(requested_profile_name)
             return requested_profile_name
-        return store.default_profile_name
+        active_profile_name = store.resolve_active_profile_name()
+        if not active_profile_name:
+            raise ValueError("当前无配置方案，请先配置连接并添加模型。")
+        return active_profile_name
 
     def _build_profile_list_response(self, *, store: LLMProfileStore) -> ProfileListResponse:
         return ProfileListResponse(
-            default_profile_name=store.default_profile_name,
-            active_profile_name=store.default_profile_name,
+            connection=ConnectionView(
+                base_url=store.connection.base_url if store.connection else None,
+                api_key_masked=store.connection.masked_api_key() if store.connection else None,
+                timeout=store.connection.timeout if store.connection else 60,
+                is_configured=store.connection.is_configured() if store.connection else False,
+            ),
+            active_profile_name=store.resolve_active_profile_name(),
             profiles=[
                 ProfileView(
                     profile_name=profile.profile_name,
                     display_name=profile.resolved_display_name(),
-                    provider_type=profile.provider_type,
-                    default_model=profile.default_model,
-                    api_key_masked=profile.masked_api_key(),
-                    base_url=profile.base_url,
+                    model_name=profile.model_name,
                     api_mode=profile.api_mode,
-                    timeout=profile.timeout,
                     extra_headers=dict(profile.extra_headers),
                     enabled_capabilities=list(profile.enabled_capabilities),
-                    is_default=profile.profile_name == store.default_profile_name,
+                    is_active=profile.profile_name == store.resolve_active_profile_name(),
                 )
                 for profile in store.profiles
             ],
         )
+
+    @staticmethod
+    def _fetch_connection_model_names(*, connection: LLMConnection) -> list[str]:
+        request_url = f"{connection.base_url.rstrip('/')}/models"
+        last_http_error: ValueError | None = None
+
+        for headers in _build_model_discovery_headers(api_key=connection.api_key):
+            request = urllib_request.Request(
+                request_url,
+                headers=headers,
+                method="GET",
+            )
+            try:
+                with urllib_request.urlopen(request, timeout=min(connection.timeout, 20)) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                return _extract_model_names_from_payload(payload)
+            except urllib_error.HTTPError as exc:
+                last_http_error = ValueError(f"获取模型失败：{_read_http_error_message(exc)}")
+                if exc.code not in {401, 403}:
+                    raise last_http_error from exc
+            except urllib_error.URLError as exc:
+                raise ValueError(f"获取模型失败：{exc.reason}") from exc
+
+        if last_http_error is not None:
+            raise last_http_error
+        return []
 
     def _execute_round_record(self, *, record: RoundRecord) -> RoundResponse:
         result = run_single_round(
@@ -448,7 +695,7 @@ class ConversationService:
         status = build_session_status(
             session_id=self.session_id,
             snapshot=snapshot,
-            active_profile_name=self._load_profile_store().default_profile_name,
+            active_profile_name=self._load_profile_store().resolve_active_profile_name(),
             result_profile_name=derive_result_profile_name(snapshot=snapshot),
             result_type=result_type,
             result_text=result_text,
@@ -620,3 +867,79 @@ def derive_result_profile_name(*, snapshot: ContextSnapshot) -> str | None:
 
 def _build_round_id() -> str:
     return f"round_{uuid4().hex[:10]}"
+
+
+def _normalize_base_url(raw_base_url: str) -> str:
+    normalized = raw_base_url.strip().rstrip("/")
+    if not normalized:
+        raise ValueError("请先填写 NewAPI base_url。")
+    if not normalized.startswith(("https://", "http://")):
+        raise ValueError("base_url 必须以 http:// 或 https:// 开头。")
+    return normalized
+
+
+def _read_http_error_message(exc: urllib_error.HTTPError) -> str:
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error_info = payload.get("error")
+        if isinstance(error_info, dict):
+            message = error_info.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return f"接口返回异常状态：{exc.code}"
+
+
+def _build_model_discovery_headers(*, api_key: str) -> list[dict[str, str]]:
+    normalized_api_key = api_key.strip()
+    base_headers = {
+        "Accept": "application/json",
+        "User-Agent": "MzAgent/0.1.24 (+https://github.com/sigerio/MzAgentSub)",
+    }
+    if not normalized_api_key:
+        return [base_headers]
+    return [
+        {
+            **base_headers,
+            "Authorization": f"Bearer {normalized_api_key}",
+            "x-api-key": normalized_api_key,
+        },
+        {
+            **base_headers,
+            "Authorization": f"Bearer {normalized_api_key}",
+        },
+    ]
+
+
+def _extract_model_names_from_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    raw_items: list[object] = []
+    for key in ("data", "models"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            raw_items.extend(value)
+
+    model_names: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_model_name = item.get("id")
+        if not isinstance(raw_model_name, str):
+            raw_model_name = item.get("name")
+        if not isinstance(raw_model_name, str):
+            continue
+        normalized = raw_model_name.strip()
+        if normalized.startswith("models/"):
+            normalized = normalized.removeprefix("models/").strip()
+        if normalized and normalized not in model_names:
+            model_names.append(normalized)
+
+    model_names.sort(key=str.lower)
+    return model_names
