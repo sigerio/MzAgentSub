@@ -993,6 +993,14 @@ function autoResizeTextarea() {
   el.goal.style.height = Math.min(el.goal.scrollHeight, 200) + "px";
 }
 
+function submitRoundForm() {
+  if (typeof el.roundForm.requestSubmit === "function") {
+    el.roundForm.requestSubmit(el.submitButton);
+    return;
+  }
+  el.submitButton.click();
+}
+
 /* ========== 事件绑定 ========== */
 
 /* 添加表单初始化 */
@@ -1028,6 +1036,17 @@ el.skillsMasterToggle.addEventListener("change", () => {
 });
 
 /* 发送表单 */
+el.goal.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !event.ctrlKey || event.altKey || event.shiftKey || event.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  if (el.submitButton.disabled) {
+    return;
+  }
+  submitRoundForm();
+});
+
 el.roundForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!validateForm()) return;

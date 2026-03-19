@@ -394,14 +394,6 @@ def judge_clarify_needed(
     if not normalized_goal:
         return (True, "目标为空。")
     if action_type == "auto":
-        if not enabled_capabilities and not rag_enabled:
-            return (True, "自动模式缺少可用能力。")
-        if "tool" in enabled_capabilities and not enabled_tools:
-            return (True, "自动模式缺少可用 Tool。")
-        if "mcp" in enabled_capabilities and not enabled_mcp:
-            return (True, "自动模式缺少可用 MCP。")
-        if "skill" in enabled_capabilities and not enabled_skills:
-            return (True, "自动模式缺少可用 Skill。")
         return (False, None)
     if action_type in {"tool", "mcp", "skill", "rag"} and not target:
         return (True, "缺少动作目标。")

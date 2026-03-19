@@ -12,6 +12,7 @@ from urllib import request as urllib_request
 
 from ..config import LLMSettings, RuntimeSettings, load_runtime_settings
 from ..contracts.context import ExecutionContext
+from ..http_headers import build_default_http_headers
 from ..contracts.llm import (
     LLMContentBlock,
     LLMMessage,
@@ -123,13 +124,17 @@ class LLMAdapter:
         if api_mode == "openai-responses":
             client = self._get_client(settings=settings)
             start_time = time.perf_counter()
-            response = client.responses.create(
-                model=model_name,
-                input=self._build_input_messages(request=request),
-                instructions=self._build_instructions(request=request),
-                tools=request.tool_schemas or None,
-                timeout=request.timeout / 1000,
-            )
+            request_payload: dict[str, object] = {
+                "model": model_name,
+                "input": self._build_input_messages(request=request),
+                "timeout": request.timeout / 1000,
+            }
+            instructions = self._build_instructions(request=request)
+            if instructions is not None:
+                request_payload["instructions"] = instructions
+            if request.tool_schemas:
+                request_payload["tools"] = request.tool_schemas
+            response = client.responses.create(**request_payload)
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             return self._normalize_responses_api_response(
                 request=request,
@@ -188,7 +193,7 @@ class LLMAdapter:
             api_key=settings.llm.api_key,
             base_url=settings.llm.base_url,
             timeout=settings.llm.timeout,
-            default_headers=settings.llm.extra_headers or None,
+            default_headers=build_default_http_headers(settings.llm.extra_headers),
         )
 
     def _normalize_responses_api_response(
@@ -408,7 +413,7 @@ class LLMAdapter:
             "Accept": "application/json",
             "x-api-key": settings.llm.api_key or "",
             "anthropic-version": "2023-06-01",
-            **settings.llm.extra_headers,
+            **build_default_http_headers(settings.llm.extra_headers),
         }
         request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         http_request = urllib_request.Request(

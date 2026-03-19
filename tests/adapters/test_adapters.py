@@ -1,6 +1,11 @@
+import asyncio
+
+import pytest
+
 from mz_agent.adapters.llm import LLMAdapter
-from mz_agent.adapters.mcp import MCPAdapter
+from mz_agent.adapters.mcp import MCPAdapter, StdioMCPClient
 from mz_agent.adapters.tool import ToolAdapter
+from mz_agent.config import MCPServerSettings
 from mz_agent.contracts.context import ExecutionContext
 from mz_agent.contracts.llm import LLMMessage, LLMRequest
 from mz_agent.contracts.tooling import (
@@ -86,6 +91,35 @@ def test_mcp_adapter_lists_capabilities_and_invokes_handler() -> None:
     ]
     assert result.text == "命中：协议"
 
+
+@pytest.mark.anyio
+async def test_stdio_mcp_client_call_tool_can_run_inside_running_event_loop() -> None:
+    client = StdioMCPClient(
+        server=MCPServerSettings(
+            name="cunzhi",
+            transport_type="stdio",
+            command="cunzhi",
+        )
+    )
+
+    async def fake_call_tool(*, tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        await asyncio.sleep(0)
+        return {
+            "texts": [f"已调用：{tool_name}"],
+            "structured": {"arguments": arguments},
+        }
+
+    client._call_tool = fake_call_tool  # type: ignore[method-assign]
+
+    result = client.call_tool(
+        tool_name="zhi",
+        arguments={"message": "调用 cunzhi"},
+    )
+
+    assert result.status == "success"
+    assert result.text == "已调用：zhi"
+    assert result.data == {"arguments": {"message": "调用 cunzhi"}}
+
 def test_llm_adapter_returns_normalized_payload() -> None:
     llm_adapter = LLMAdapter()
     execution_context = ExecutionContext(
@@ -106,4 +140,4 @@ def test_llm_adapter_returns_normalized_payload() -> None:
     )
 
     assert llm_result.provider_trace is not None
-    assert llm_result.provider_trace.provider in {"openai_native", "openai_compatible_proxy"}
+    assert llm_result.provider_trace.provider == "newapi"

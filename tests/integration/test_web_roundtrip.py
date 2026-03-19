@@ -8,7 +8,8 @@ def test_web_index_and_roundtrip_render_history(tmp_path: Path) -> None:
 
     index_response = call_app(app, method="GET", path="/")
     assert index_response["status"] == 200
-    assert "任务控制台" in index_response["text"]
+    assert "MzAgent" in index_response["text"]
+    assert "连接设置" in index_response["text"]
     assert "sess_web_test" in index_response["text"]
 
     round_response = call_app(

@@ -19,8 +19,11 @@ from ..capabilities import (
     load_capability_registry,
     save_capability_registry,
 )
-from ..contracts.context import ContextSnapshot
+from ..contracts.action import AvailableAction, NextAction
+from ..contracts.context import ContextSnapshot, ExecutionContext
+from ..contracts.llm import LLMMessage, LLMRequest
 from ..contracts.state import ReactStatus
+from ..http_headers import build_default_http_headers
 from ..llm_profiles import (
     DEFAULT_API_MODE,
     LLMConnection,
@@ -30,7 +33,17 @@ from ..llm_profiles import (
     save_profile_store,
 )
 from ..orchestration import FileBackedSTM, Pipeline, PipelineRoundResult
-from .runtime import RuntimeOptions, build_runtime, render_round_result, run_single_round
+from ..runtime.writeback import prepare_writeback_record
+from .runtime import (
+    RuntimeOptions,
+    build_available_actions,
+    build_pending_action_arguments,
+    build_request_identifiers,
+    build_runtime,
+    extract_text_from_llm_response,
+    render_round_result,
+    run_single_round,
+)
 
 ResultType = Literal["finish", "clarify", "tool", "mcp", "llm", "rag", "skill", "error", "unknown"]
 StatusKey = Literal["idle", "needs_clarify", "completed", "failed"]
@@ -101,6 +114,27 @@ class RoundResponse(BaseModel):
     result_text: str
     history: list[ConversationMessage] = Field(default_factory=list)
     raw_result: dict[str, object]
+
+
+class AutoActionDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_type: Literal["llm", "tool", "mcp", "skill", "rag", "finish", "clarify"] = "llm"
+    target: str | None = None
+    arguments: dict[str, object] = Field(default_factory=dict)
+    respond_with_llm: bool = True
+    expect_user_followup: bool = False
+    reason: str = ""
+
+
+class PendingExternalInteraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["mcp"]
+    target: str
+    prompt: str
+    resume_strategy: str = "llm_route"
+    last_observation: dict[str, object] = Field(default_factory=dict)
 
 
 class HistoryResponse(BaseModel):
@@ -670,6 +704,8 @@ class ConversationService:
         return []
 
     def _execute_round_record(self, *, record: RoundRecord) -> RoundResponse:
+        if record.action_type == "auto":
+            return self._execute_auto_round_record(record=record)
         result = run_single_round(
             options=self._options,
             pipeline=self._pipeline,
@@ -711,6 +747,451 @@ class ConversationService:
             history=history,
             raw_result=result.model_dump(mode="json"),
         )
+
+    def _execute_auto_round_record(
+        self,
+        *,
+        record: RoundRecord,
+    ) -> RoundResponse:
+        snapshot = self._stm.latest_context_snapshot()
+        available_actions = build_available_actions(
+            pipeline=self._pipeline,
+            action_type="auto",
+            target=None,
+            enabled_capabilities=record.enabled_capabilities,
+            enabled_tools=record.enabled_tools,
+            enabled_mcp=record.enabled_mcp,
+            enabled_skills=record.enabled_skills,
+            rag_enabled=record.rag_enabled,
+        )
+        route_decision = self._decide_auto_action(
+            record=record,
+            snapshot=snapshot,
+            available_actions=available_actions,
+        )
+        if route_decision.action_type in {"llm", "finish", "clarify"}:
+            snapshot = self._with_pending_external_interaction(
+                snapshot=snapshot,
+                pending=None,
+            )
+            return self._complete_round_with_llm(
+                record=record,
+                snapshot=snapshot,
+                intermediate_observations=[],
+                route_decision=route_decision,
+            )
+
+        observation = self._execute_auto_action(
+            record=record,
+            decision=route_decision,
+        )
+        intermediate_observations = [observation]
+        if route_decision.expect_user_followup and observation.get("source") == "mcp":
+            pending = self._build_pending_external_interaction(
+                decision=route_decision,
+                observation=observation,
+            )
+            if pending is not None:
+                snapshot = self._with_pending_external_interaction(
+                    snapshot=snapshot,
+                    pending=pending,
+                )
+                return self._complete_round_with_observation(
+                    record=record,
+                    snapshot=snapshot,
+                    observation=observation,
+                    intermediate_observations=intermediate_observations,
+                    route_decision=route_decision,
+                )
+
+        if not route_decision.respond_with_llm:
+            snapshot = self._with_pending_external_interaction(
+                snapshot=snapshot,
+                pending=None,
+            )
+            return self._complete_round_with_observation(
+                record=record,
+                snapshot=snapshot,
+                observation=observation,
+                intermediate_observations=intermediate_observations,
+                route_decision=route_decision,
+            )
+
+        snapshot = self._with_pending_external_interaction(
+            snapshot=snapshot,
+            pending=None,
+        )
+        return self._complete_round_with_llm(
+            record=record,
+            snapshot=snapshot,
+            intermediate_observations=intermediate_observations,
+            route_decision=route_decision,
+        )
+
+    def _complete_round_with_llm(
+        self,
+        *,
+        record: RoundRecord,
+        snapshot: ContextSnapshot,
+        intermediate_observations: list[dict[str, object]],
+        route_decision: AutoActionDecision | None = None,
+    ) -> RoundResponse:
+        prepared_snapshot = self._prepare_snapshot_for_round_response(
+            snapshot=snapshot,
+            goal=record.goal,
+            round_id=record.round_id,
+        )
+        pending_external_interaction = self._read_pending_external_interaction(
+            snapshot=prepared_snapshot
+        )
+        history_messages = [
+            LLMMessage(
+                role=message.role if message.role in {"system", "user", "assistant", "tool"} else "assistant",
+                content=message.content,
+            )
+            for message in read_conversation_history(snapshot=prepared_snapshot)
+        ]
+        llm_request = LLMRequest(
+            messages=[
+                LLMMessage(
+                    role="system",
+                    content=_build_llm_completion_instruction(
+                        goal=record.goal,
+                        intermediate_observations=intermediate_observations,
+                        pending_external_interaction=(
+                            pending_external_interaction.model_dump(mode="json")
+                            if pending_external_interaction is not None
+                            else None
+                        ),
+                    ),
+                ),
+                *history_messages,
+                LLMMessage(role="user", content=record.goal),
+            ],
+            model_policy="quality",
+            profile_name=record.profile_name,
+        )
+        request_id, trace_id = build_request_identifiers(
+            request_prefix=self._options.request_prefix,
+            trace_prefix=self._options.trace_prefix,
+            action_type="llm",
+        )
+        completion_trace_id = f"{trace_id}.completion"
+        llm_response = self._pipeline.adapters.llm.respond(
+            request=llm_request,
+            execution_context=ExecutionContext(
+                request_id=request_id,
+                session_id=self.session_id,
+                plan_id=None,
+                trace_id=completion_trace_id,
+                source="react",
+            ),
+        )
+        self._stm.replace_context_snapshot(snapshot=prepared_snapshot)
+        snapshot = self._stm.apply_writeback(
+            record=prepare_writeback_record(
+                stage="post_action",
+                execution_context=ExecutionContext(
+                    request_id=request_id,
+                    session_id=self.session_id,
+                    plan_id=None,
+                    trace_id=completion_trace_id,
+                    source="react",
+                ),
+                react_status=ReactStatus.RUNNING,
+                current_step=None,
+                observation={
+                    "source": "llm",
+                    "response": llm_response.model_dump(mode="json"),
+                },
+                metadata={
+                    "guardrails_decision": "allow",
+                    "llm_completion_enforced": True,
+                    "intermediate_sources": [
+                        str(item.get("source"))
+                        for item in intermediate_observations
+                        if isinstance(item.get("source"), str)
+                    ],
+                },
+            )
+        )
+        snapshot = self._append_round_record(snapshot=snapshot, record=record)
+        history = read_conversation_history(snapshot=snapshot)
+        result_text = derive_result_text_from_snapshot(snapshot=snapshot) or ""
+        status = build_session_status(
+            session_id=self.session_id,
+            snapshot=snapshot,
+            active_profile_name=self._load_profile_store().resolve_active_profile_name(),
+            result_profile_name=derive_result_profile_name(snapshot=snapshot),
+            result_type="llm",
+            result_text=result_text,
+        )
+        return RoundResponse(
+            session_id=self.session_id,
+            round_id=record.round_id,
+            retry_from_round_id=record.retry_from_round_id,
+            profile_name=record.profile_name,
+            status=status,
+            result_type="llm",
+            result_text=result_text,
+            history=history,
+            raw_result={
+                "llm_completion_enforced": True,
+                "intermediate_observations": intermediate_observations,
+                "final_observation": snapshot.last_observation or {},
+                "route_decision": route_decision.model_dump(mode="json") if route_decision is not None else {},
+                "pending_external_interaction": (
+                    pending_external_interaction.model_dump(mode="json")
+                    if pending_external_interaction is not None
+                    else None
+                ),
+            },
+        )
+
+    def _complete_round_with_observation(
+        self,
+        *,
+        record: RoundRecord,
+        snapshot: ContextSnapshot,
+        observation: dict[str, object],
+        intermediate_observations: list[dict[str, object]],
+        route_decision: AutoActionDecision,
+    ) -> RoundResponse:
+        prepared_snapshot = self._prepare_snapshot_for_round_response(
+            snapshot=snapshot,
+            goal=record.goal,
+            round_id=record.round_id,
+        )
+        request_id, trace_id = build_request_identifiers(
+            request_prefix=self._options.request_prefix,
+            trace_prefix=self._options.trace_prefix,
+            action_type=str(observation.get("source", route_decision.action_type)),
+        )
+        self._stm.replace_context_snapshot(snapshot=prepared_snapshot)
+        snapshot = self._stm.apply_writeback(
+            record=prepare_writeback_record(
+                stage="post_action",
+                execution_context=ExecutionContext(
+                    request_id=request_id,
+                    session_id=self.session_id,
+                    plan_id=None,
+                    trace_id=f"{trace_id}.pending",
+                    source="react",
+                ),
+                react_status=ReactStatus.RUNNING,
+                current_step=None,
+                observation=observation,
+                metadata={
+                    "guardrails_decision": "allow",
+                    "llm_completion_enforced": False,
+                },
+            )
+        )
+        snapshot = self._append_round_record(snapshot=snapshot, record=record)
+        history = read_conversation_history(snapshot=snapshot)
+        result_type = str(observation.get("source", "unknown"))
+        result_text = derive_result_text_from_snapshot(snapshot=snapshot) or ""
+        pending_external_interaction = self._read_pending_external_interaction(snapshot=snapshot)
+        status = build_session_status(
+            session_id=self.session_id,
+            snapshot=snapshot,
+            active_profile_name=self._load_profile_store().resolve_active_profile_name(),
+            result_profile_name=derive_result_profile_name(snapshot=snapshot),
+            result_type=result_type if result_type in {"tool", "mcp", "llm", "rag", "skill"} else "unknown",
+            result_text=result_text,
+        )
+        return RoundResponse(
+            session_id=self.session_id,
+            round_id=record.round_id,
+            retry_from_round_id=record.retry_from_round_id,
+            profile_name=record.profile_name,
+            status=status,
+            result_type=result_type if result_type in {"tool", "mcp", "llm", "rag", "skill"} else "unknown",
+            result_text=result_text,
+            history=history,
+            raw_result={
+                "llm_completion_enforced": False,
+                "intermediate_observations": intermediate_observations,
+                "final_observation": observation,
+                "route_decision": route_decision.model_dump(mode="json"),
+                "pending_external_interaction": (
+                    pending_external_interaction.model_dump(mode="json")
+                    if pending_external_interaction is not None
+                    else None
+                ),
+            },
+        )
+
+    def _prepare_snapshot_for_round_response(
+        self,
+        *,
+        snapshot: ContextSnapshot,
+        goal: str,
+        round_id: str,
+    ) -> ContextSnapshot:
+        perception = dict(snapshot.perception)
+        perception["pending_user_message"] = goal
+        perception["pending_round_id"] = round_id
+        return snapshot.model_copy(update={"perception": perception})
+
+    def _decide_auto_action(
+        self,
+        *,
+        record: RoundRecord,
+        available_actions: list[AvailableAction],
+        snapshot: ContextSnapshot,
+    ) -> AutoActionDecision:
+        candidate_actions = [
+            action
+            for action in available_actions
+            if action.availability == "available" and action.action_type not in {"llm", "clarify", "finish"}
+        ]
+        if not candidate_actions:
+            return AutoActionDecision(action_type="llm", respond_with_llm=True)
+
+        pending_external_interaction = self._read_pending_external_interaction(snapshot=snapshot)
+        history_messages = [
+            LLMMessage(
+                role=message.role if message.role in {"system", "user", "assistant", "tool"} else "assistant",
+                content=message.content,
+            )
+            for message in read_conversation_history(snapshot=snapshot)
+        ]
+        llm_request = LLMRequest(
+            messages=[
+                LLMMessage(
+                    role="system",
+                    content=_build_auto_route_instruction(
+                        available_actions=candidate_actions,
+                        pending_external_interaction=(
+                            pending_external_interaction.model_dump(mode="json")
+                            if pending_external_interaction is not None
+                            else None
+                        ),
+                    ),
+                ),
+                *history_messages,
+                LLMMessage(role="user", content=record.goal),
+            ],
+            model_policy="quality",
+            profile_name=record.profile_name,
+        )
+        request_id, trace_id = build_request_identifiers(
+            request_prefix=self._options.request_prefix,
+            trace_prefix=self._options.trace_prefix,
+            action_type="llm",
+        )
+        llm_response = self._pipeline.adapters.llm.respond(
+            request=llm_request,
+            execution_context=ExecutionContext(
+                request_id=request_id,
+                session_id=self.session_id,
+                plan_id=None,
+                trace_id=f"{trace_id}.route",
+                source="react",
+            ),
+        )
+        decision = _parse_auto_action_decision(
+            text=extract_text_from_llm_response(
+                response=llm_response.model_dump(mode="json")
+            ),
+            available_actions=candidate_actions,
+            pending_external_interaction=pending_external_interaction,
+        )
+        return decision or AutoActionDecision(action_type="llm", respond_with_llm=True)
+
+    def _execute_auto_action(
+        self,
+        *,
+        record: RoundRecord,
+        decision: AutoActionDecision,
+    ) -> dict[str, object]:
+        arguments = dict(decision.arguments)
+        if not arguments:
+            arguments = build_pending_action_arguments(
+                action_type=decision.action_type,
+                target=decision.target,
+                goal=record.goal,
+                profile_name=record.profile_name,
+            ) or {}
+        next_action = _build_routed_next_action(
+            goal=record.goal,
+            profile_name=record.profile_name,
+            action_type=decision.action_type,
+            target=decision.target,
+            arguments=arguments,
+        )
+        request_id, trace_id = build_request_identifiers(
+            request_prefix=self._options.request_prefix,
+            trace_prefix=self._options.trace_prefix,
+            action_type=decision.action_type,
+        )
+        try:
+            return self._pipeline.adapters.dispatch(
+                action=next_action,
+                execution_context=ExecutionContext(
+                    request_id=request_id,
+                    session_id=self.session_id,
+                    plan_id=None,
+                    trace_id=f"{trace_id}.chain",
+                    source="react",
+                ),
+            )
+        except Exception as exc:
+            return {
+                "source": decision.action_type,
+                "error": {
+                    "message": str(exc),
+                    "target": decision.target,
+                },
+            }
+
+    @staticmethod
+    def _build_pending_external_interaction(
+        *,
+        decision: AutoActionDecision,
+        observation: dict[str, object],
+    ) -> PendingExternalInteraction | None:
+        result = observation.get("result")
+        if not isinstance(result, dict):
+            return None
+        text = result.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if not decision.target:
+            return None
+        return PendingExternalInteraction(
+            source="mcp",
+            target=decision.target,
+            prompt=text.strip(),
+            last_observation=observation,
+        )
+
+    @staticmethod
+    def _read_pending_external_interaction(
+        *,
+        snapshot: ContextSnapshot,
+    ) -> PendingExternalInteraction | None:
+        raw_pending = snapshot.perception.get("pending_external_interaction")
+        if not isinstance(raw_pending, dict):
+            return None
+        try:
+            return PendingExternalInteraction.model_validate(raw_pending)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _with_pending_external_interaction(
+        *,
+        snapshot: ContextSnapshot,
+        pending: PendingExternalInteraction | None,
+    ) -> ContextSnapshot:
+        perception = dict(snapshot.perception)
+        if pending is None:
+            perception.pop("pending_external_interaction", None)
+        else:
+            perception["pending_external_interaction"] = pending.model_dump(mode="json")
+        return snapshot.model_copy(update={"perception": perception})
 
     def _append_round_record(
         self,
@@ -899,7 +1380,7 @@ def _build_model_discovery_headers(*, api_key: str) -> list[dict[str, str]]:
     normalized_api_key = api_key.strip()
     base_headers = {
         "Accept": "application/json",
-        "User-Agent": "MzAgent/0.1.24 (+https://github.com/sigerio/MzAgentSub)",
+        **build_default_http_headers(),
     }
     if not normalized_api_key:
         return [base_headers]
@@ -914,6 +1395,171 @@ def _build_model_discovery_headers(*, api_key: str) -> list[dict[str, str]]:
             "Authorization": f"Bearer {normalized_api_key}",
         },
     ]
+
+
+def _build_llm_completion_instruction(
+    *,
+    goal: str,
+    intermediate_observations: list[dict[str, object]],
+    pending_external_interaction: dict[str, object] | None = None,
+) -> str:
+    summary_lines = [
+        json.dumps(observation, ensure_ascii=False)
+        for observation in intermediate_observations
+    ]
+    summary = "\n".join(summary_lines) if summary_lines else "无可用中间结果。"
+    pending_summary = (
+        json.dumps(pending_external_interaction, ensure_ascii=False)
+        if pending_external_interaction is not None
+        else "无待续外部交互。"
+    )
+    return "\n".join(
+        [
+            "你是 MzAgent 的最终答复层。",
+            "当前轮次已经执行了若干中间编排节点，你必须继续面向用户给出最终答复。",
+            "任一中间节点失败、为空、未命中，都不应阻断后续推理和最终答复。",
+            "不要停留在工具结果、技能元数据或内部流程描述上。",
+            "如果中间结果不足以完整完成任务，也要明确说明不足，并基于已有信息继续尽可能回答用户。",
+            f"用户原始输入：{goal}",
+            f"中间执行结果：{summary}",
+            f"待续外部交互：{pending_summary}",
+        ]
+    )
+
+
+def _build_auto_route_instruction(
+    *,
+    available_actions: list[AvailableAction],
+    pending_external_interaction: dict[str, object] | None,
+) -> str:
+    available_payload = [
+        {
+            "action_type": action.action_type,
+            "targets": list(action.targets),
+        }
+        for action in available_actions
+    ]
+    pending_summary = (
+        json.dumps(pending_external_interaction, ensure_ascii=False)
+        if pending_external_interaction is not None
+        else "无"
+    )
+    return "\n".join(
+        [
+            "你是 MzAgent 的自动编排路由器。",
+            "你只负责判断本轮是否需要调用外部能力，不负责直接回答用户问题。",
+            "普通自然语言默认先交给 LLM，不要因为用户提到了某个服务名就直接调用 MCP。",
+            "只有当外部能力明显更合适时，才选择 tool/mcp/skill/rag。",
+            "如果存在待续外部交互，也必须先综合当前用户输入再决定是否继续同一个外部交互。",
+            "你必须只输出一个 JSON 对象，不要输出解释。",
+            "JSON 字段固定为：action_type、target、arguments、respond_with_llm、expect_user_followup、reason。",
+            "其中：",
+            "- action_type 只允许是 llm/tool/mcp/skill/rag",
+            "- target 在需要外部能力时填写，否则为 null",
+            "- arguments 为对象；若选择 mcp 且目标需要 message，请直接生成合适的 message，不要机械照抄服务名",
+            "- respond_with_llm 表示执行完外部能力后是否继续回到 LLM",
+            "- expect_user_followup 表示外部能力这一步主要是向用户继续提问或收集信息",
+            f"当前可用动作：{json.dumps(available_payload, ensure_ascii=False)}",
+            f"当前待续外部交互：{pending_summary}",
+        ]
+    )
+
+
+def _parse_auto_action_decision(
+    *,
+    text: str,
+    available_actions: list[AvailableAction],
+    pending_external_interaction: PendingExternalInteraction | None,
+) -> AutoActionDecision | None:
+    payload = _extract_json_object(text=text)
+    if payload is None:
+        return None
+    try:
+        decision = AutoActionDecision.model_validate(payload)
+    except Exception:
+        return None
+
+    allowed_targets = {
+        action.action_type: list(action.targets)
+        for action in available_actions
+    }
+    if decision.action_type == "llm":
+        return decision
+
+    available_targets = allowed_targets.get(decision.action_type, [])
+    target = decision.target
+    if target is None and pending_external_interaction is not None:
+        if pending_external_interaction.target in available_targets:
+            target = pending_external_interaction.target
+    if target is None and len(available_targets) == 1:
+        target = available_targets[0]
+    if decision.action_type in {"tool", "mcp", "skill"} and target not in available_targets:
+        return AutoActionDecision(action_type="llm", respond_with_llm=True)
+    return decision.model_copy(update={"target": target})
+
+
+def _extract_json_object(*, text: str) -> dict[str, object] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("```"):
+        first_brace = stripped.find("{")
+        last_brace = stripped.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            stripped = stripped[first_brace:last_brace + 1]
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        first_brace = stripped.find("{")
+        last_brace = stripped.rfind("}")
+        if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
+            return None
+        try:
+            payload = json.loads(stripped[first_brace:last_brace + 1])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _build_routed_next_action(
+    *,
+    goal: str,
+    profile_name: str | None,
+    action_type: str,
+    target: str | None,
+    arguments: dict[str, object],
+) -> NextAction:
+    if action_type == "tool":
+        return NextAction(
+            action_type="tool",
+            action_target=target,
+            action_input={"arguments": arguments},
+        )
+    if action_type == "mcp":
+        return NextAction(
+            action_type="mcp",
+            action_target=target,
+            action_input={"arguments": arguments},
+        )
+    if action_type == "rag":
+        return NextAction(
+            action_type="rag",
+            action_target=None,
+            action_input={"query": str(arguments.get("query", goal))},
+        )
+    if action_type == "skill":
+        return NextAction(
+            action_type="skill",
+            action_target=target,
+            action_input={"skill_name": target} if target else {},
+        )
+    return NextAction(
+        action_type="llm",
+        action_target=None,
+        action_input={"profile_name": profile_name} if profile_name else {},
+    )
 
 
 def _extract_model_names_from_payload(payload: object) -> list[str]:

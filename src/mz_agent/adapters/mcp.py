@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from concurrent.futures import Future
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Protocol
+import threading
+from typing import Any, Protocol, TypeVar
 
-from ..config import MCPServerSettings, RuntimeSettings, load_runtime_settings
+from ..config import (
+    LLMSettings,
+    MCPServerSettings,
+    RuntimeSettings,
+    discover_project_root,
+    load_pyproject,
+    load_runtime_settings,
+    parse_mcp_servers,
+)
 from ..contracts.context import ExecutionContext
 from ..contracts.tooling import MCPBinding, ToolExecutionResult
 
@@ -30,7 +40,7 @@ class MCPAdapter:
     ) -> None:
         self._bindings: dict[tuple[str, str], MCPBinding] = {}
         self._handlers: dict[tuple[str, str], Callable[..., object]] = {}
-        self._settings = settings or load_runtime_settings(project_root)
+        self._settings = settings or self._load_settings(project_root=project_root)
         self._client_factory = client_factory
 
     def list_servers(self) -> list[MCPServerSettings]:
@@ -181,13 +191,31 @@ class MCPAdapter:
             return self._client_factory(server)
         return StdioMCPClient(server=server)
 
+    @staticmethod
+    def _load_settings(*, project_root: str | Path | None) -> RuntimeSettings:
+        try:
+            return load_runtime_settings(project_root)
+        except ValueError:
+            root = discover_project_root(project_root)
+            pyproject_data = load_pyproject(root / "pyproject.toml")
+            return RuntimeSettings(
+                project_root=root,
+                llm=LLMSettings(),
+                active_profile_name=None,
+                llm_profiles={},
+                mcp_servers=parse_mcp_servers(pyproject_data),
+            )
+
+
+AsyncResultT = TypeVar("AsyncResultT")
+
 
 class StdioMCPClient:
     def __init__(self, *, server: MCPServerSettings) -> None:
         self._server = server
 
     def list_tools(self) -> list[dict[str, object]]:
-        tools = asyncio.run(self._list_tools())
+        tools = self._run_async_operation(self._list_tools)
         return [
             {
                 "server_name": self._server.name,
@@ -201,7 +229,9 @@ class StdioMCPClient:
         ]
 
     def call_tool(self, *, tool_name: str, arguments: dict[str, object]) -> ToolExecutionResult:
-        payload = asyncio.run(self._call_tool(tool_name=tool_name, arguments=arguments))
+        payload = self._run_async_operation(
+            lambda: self._call_tool(tool_name=tool_name, arguments=arguments)
+        )
         text = "\n".join(payload["texts"]).strip()
         data = payload["structured"]
         return ToolExecutionResult(
@@ -213,6 +243,33 @@ class StdioMCPClient:
                 "structured_content": data,
             },
         )
+
+    def _run_async_operation(
+        self,
+        operation: Callable[[], Awaitable[AsyncResultT]],
+    ) -> AsyncResultT:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(operation())
+
+        future: Future[AsyncResultT] = Future()
+
+        def runner() -> None:
+            try:
+                result = asyncio.run(operation())
+            except Exception as exc:
+                future.set_exception(exc)
+                return
+            future.set_result(result)
+
+        thread = threading.Thread(
+            target=runner,
+            name=f"mcp-stdio-{self._server.name}",
+            daemon=True,
+        )
+        thread.start()
+        return future.result()
 
     async def _list_tools(self) -> list[dict[str, object]]:
         from mcp import ClientSession, StdioServerParameters

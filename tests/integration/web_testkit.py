@@ -14,6 +14,31 @@ def build_test_app(tmp_path: Path, *, session_id: str = "sess_web_test"):
         '[project]\nname = "demo"\nversion = "0.0.1"\n',
         encoding="utf-8",
     )
+    (tmp_path / ".mz_agent").mkdir()
+    (tmp_path / ".mz_agent" / "llm_profiles.json").write_text(
+        json.dumps(
+            {
+                "connection": {
+                    "base_url": "https://example.com/v1",
+                    "api_key": "sk-test",
+                    "timeout": 60,
+                },
+                "active_profile_name": "default",
+                "profiles": [
+                    {
+                        "profile_name": "default",
+                        "display_name": "Default",
+                        "model_name": "gpt-test",
+                        "api_mode": "openai-responses",
+                        "extra_headers": {},
+                        "enabled_capabilities": [],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     options = RuntimeOptions(
         stm_path=".mz_agent/test_web_stm.json",
         session_id=session_id,

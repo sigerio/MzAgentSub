@@ -53,6 +53,44 @@ def test_react_engine_prefers_skill_before_other_actions() -> None:
     assert result.next_action.action_target == "writer"
 
 
+def test_react_engine_prefers_explicit_preferred_action_before_tool() -> None:
+    engine = ReActEngine()
+    result = engine.decide(
+        request=ReActRequest(
+            goal="继续外部交互",
+            context_snapshot=ContextSnapshot(
+                current_plan=None,
+                perception={
+                    "preferred_auto_action_type": "mcp",
+                    "preferred_mcp_target": "review:ask",
+                    "available_action_arguments": {
+                        "mcp": {
+                            "review:ask": {"message": "继续追问", "is_markdown": True},
+                        }
+                    },
+                },
+            ),
+            available_actions=[
+                AvailableAction(
+                    action_type="tool",
+                    targets=["search_docs"],
+                    availability="available",
+                ),
+                AvailableAction(
+                    action_type="mcp",
+                    targets=["review:ask"],
+                    availability="available",
+                ),
+            ],
+        )
+    )
+
+    assert result.react_status is ReactStatus.RUNNING
+    assert result.next_action is not None
+    assert result.next_action.action_type == "mcp"
+    assert result.next_action.action_target == "review:ask"
+
+
 def test_pipeline_pre_action_clarify_switches_to_answer_chain() -> None:
     pipeline = Pipeline(
         guardrails_evaluator=StaticGuardrailsEvaluator(
@@ -84,4 +122,3 @@ def test_pipeline_pre_action_clarify_switches_to_answer_chain() -> None:
     assert result.output_text == "请补充必要信息。"
     assert result.writeback_record is not None
     assert result.writeback_record.stage == "post_answer"
-

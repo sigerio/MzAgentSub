@@ -60,6 +60,11 @@ class ReActEngine:
 
     def _select_action(self, *, request: ReActRequest) -> AvailableAction | None:
         preferred_skill = request.context_snapshot.skill_context.get("selected_skill")
+        preferred_action_type = request.context_snapshot.perception.get("preferred_auto_action_type")
+        if isinstance(preferred_action_type, str):
+            preferred_action = self._find_action(request.available_actions, preferred_action_type)
+            if preferred_action is not None and preferred_action.availability == "available":
+                return preferred_action
 
         for action_type in ACTION_PRIORITY:
             action = self._find_action(request.available_actions, action_type)
@@ -117,15 +122,21 @@ class ReActEngine:
             )
 
         if action.action_type == "mcp":
+            preferred_mcp_target = context_snapshot.perception.get("preferred_mcp_target")
+            resolved_target = (
+                str(preferred_mcp_target)
+                if isinstance(preferred_mcp_target, str) and preferred_mcp_target in action.targets
+                else self._first_target(action.targets)
+            )
             return NextAction(
                 action_type="mcp",
-                action_target=self._first_target(action.targets),
+                action_target=resolved_target,
                 action_input={
                     "arguments": _build_action_arguments(
                         context_snapshot=context_snapshot,
                         goal=goal,
                         action_type="mcp",
-                        target=self._first_target(action.targets),
+                        target=resolved_target,
                     )
                 },
             )

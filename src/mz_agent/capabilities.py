@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .adapters.mcp import MCPAdapter
 from .config import load_runtime_settings
 
 CapabilityType = Literal["tool", "mcp", "skill"]
@@ -96,13 +97,33 @@ def save_capability_registry(*, project_root: Path, registry: CapabilityRegistry
 
 def build_default_capability_registry(*, project_root: Path) -> CapabilityRegistry:
     runtime_settings = load_runtime_settings(project_root)
+    mcp_adapter = MCPAdapter(project_root=project_root, settings=runtime_settings)
     mcp_items: list[CapabilityItem] = []
     for server in sorted(runtime_settings.mcp_servers.values(), key=lambda item: item.name):
-        default_tool_name = "zhi" if server.name == "cunzhi" else None
-        capability_name = f"{server.name}:{default_tool_name}" if default_tool_name else server.name
+        discovered_tools = mcp_adapter.list_capabilities(server_name=server.name)
+        if discovered_tools:
+            for item in discovered_tools:
+                tool_name = item.get("tool_name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                description = item.get("description")
+                mcp_items.append(
+                    CapabilityItem(
+                        name=f"{server.name}:{tool_name}",
+                        description=(
+                            description
+                            if isinstance(description, str) and description
+                            else f"{server.name}:{tool_name} MCP 能力入口"
+                        ),
+                        enabled=True,
+                        transport=server.transport_type,
+                        command=server.command,
+                    )
+                )
+            continue
         mcp_items.append(
             CapabilityItem(
-                name=capability_name,
+                name=server.name,
                 description=f"{server.name} MCP 能力入口",
                 enabled=True,
                 transport=server.transport_type,

@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from ..app import ConversationService, RuntimeOptions
-from ..app.conversation import ProfilePayload, RoundSubmission
+from ..app.conversation import ConnectionPayload, ProfilePayload, RoundSubmission
 from ..capabilities import CapabilityItem, CapabilityType
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
@@ -43,7 +43,7 @@ class MzAgentWebApp:
             if method == "GET" and path == "/api/agent/stream":
                 await self._handle_agent_stream(query=query, send=send)
                 return
-            if path.startswith("/api/llm/profiles"):
+            if path.startswith("/api/llm/"):
                 await self._handle_profile_routes(
                     method=method,
                     path=path,
@@ -140,16 +140,27 @@ class MzAgentWebApp:
             response = self._service.list_profiles()
             await _send_json(send, status=200, payload=response.model_dump(mode="json"))
             return
+        if parts == ["api", "llm", "connection"] and method == "POST":
+            payload = ConnectionPayload.model_validate(await _read_json_body(receive=receive))
+            response = self._service.save_connection(payload=payload)
+            await _send_json(send, status=200, payload=response.model_dump(mode="json"))
+            return
+        if parts == ["api", "llm", "connection", "models"] and method in {"GET", "POST"}:
+            response = self._service.discover_connection_models()
+            await _send_json(send, status=200, payload=response.model_dump(mode="json"))
+            return
         if parts == ["api", "llm", "profiles"] and method == "POST":
             payload = ProfilePayload.model_validate(await _read_json_body(receive=receive))
             response = self._service.save_profile(payload=payload)
             await _send_json(send, status=200, payload=response.model_dump(mode="json"))
             return
-        if len(parts) == 4 and parts[:3] == ["api", "llm", "profiles"] and method == "PUT":
-            payload_data = await _read_json_body(receive=receive)
-            payload_data["profile_name"] = parts[3]
-            payload = ProfilePayload.model_validate(payload_data)
-            response = self._service.save_profile(payload=payload)
+        if (
+            len(parts) == 5
+            and parts[:3] == ["api", "llm", "profiles"]
+            and parts[4] == "test"
+            and method == "POST"
+        ):
+            response = self._service.test_profile_connection(profile_name=unquote(parts[3]))
             await _send_json(send, status=200, payload=response.model_dump(mode="json"))
             return
         if len(parts) == 4 and parts[:3] == ["api", "llm", "profiles"] and method == "DELETE":
