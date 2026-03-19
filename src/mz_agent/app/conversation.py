@@ -41,6 +41,7 @@ from .runtime import (
     build_request_identifiers,
     build_runtime,
     extract_text_from_llm_response,
+    prepare_snapshot_for_round,
     render_round_result,
     run_single_round,
 )
@@ -753,7 +754,20 @@ class ConversationService:
         *,
         record: RoundRecord,
     ) -> RoundResponse:
-        snapshot = self._stm.latest_context_snapshot()
+        snapshot = prepare_snapshot_for_round(
+            snapshot=self._stm.latest_context_snapshot(),
+            goal=record.goal,
+            action_type="auto",
+            target=record.target,
+            profile_name=record.profile_name or self._options.profile_name,
+            enabled_capabilities=record.enabled_capabilities,
+            enabled_tools=record.enabled_tools,
+            enabled_mcp=record.enabled_mcp,
+            enabled_skills=record.enabled_skills,
+            rag_enabled=record.rag_enabled,
+            round_id=record.round_id,
+            draft_answer=self._options.draft_answer,
+        )
         available_actions = build_available_actions(
             pipeline=self._pipeline,
             action_type="auto",
@@ -786,6 +800,7 @@ class ConversationService:
             decision=route_decision,
         )
         intermediate_observations = [observation]
+        pending: PendingExternalInteraction | None = None
         if route_decision.expect_user_followup and observation.get("source") == "mcp":
             pending = self._build_pending_external_interaction(
                 decision=route_decision,
@@ -796,13 +811,14 @@ class ConversationService:
                     snapshot=snapshot,
                     pending=pending,
                 )
-                return self._complete_round_with_observation(
-                    record=record,
-                    snapshot=snapshot,
-                    observation=observation,
-                    intermediate_observations=intermediate_observations,
-                    route_decision=route_decision,
-                )
+                if not route_decision.respond_with_llm:
+                    return self._complete_round_with_observation(
+                        record=record,
+                        snapshot=snapshot,
+                        observation=observation,
+                        intermediate_observations=intermediate_observations,
+                        route_decision=route_decision,
+                    )
 
         if not route_decision.respond_with_llm:
             snapshot = self._with_pending_external_interaction(
@@ -819,7 +835,7 @@ class ConversationService:
 
         snapshot = self._with_pending_external_interaction(
             snapshot=snapshot,
-            pending=None,
+            pending=pending,
         )
         return self._complete_round_with_llm(
             record=record,
@@ -836,11 +852,7 @@ class ConversationService:
         intermediate_observations: list[dict[str, object]],
         route_decision: AutoActionDecision | None = None,
     ) -> RoundResponse:
-        prepared_snapshot = self._prepare_snapshot_for_round_response(
-            snapshot=snapshot,
-            goal=record.goal,
-            round_id=record.round_id,
-        )
+        prepared_snapshot = snapshot
         pending_external_interaction = self._read_pending_external_interaction(
             snapshot=prepared_snapshot
         )
@@ -887,10 +899,12 @@ class ConversationService:
                 source="react",
             ),
         )
+        llm_response_payload = llm_response.model_dump(mode="json")
+        llm_text = extract_text_from_llm_response(response=llm_response_payload).strip()
         self._stm.replace_context_snapshot(snapshot=prepared_snapshot)
         snapshot = self._stm.apply_writeback(
             record=prepare_writeback_record(
-                stage="post_action",
+                stage="post_answer",
                 execution_context=ExecutionContext(
                     request_id=request_id,
                     session_id=self.session_id,
@@ -898,12 +912,13 @@ class ConversationService:
                     trace_id=completion_trace_id,
                     source="react",
                 ),
-                react_status=ReactStatus.RUNNING,
+                react_status=ReactStatus.FINISHED,
                 current_step=None,
                 observation={
                     "source": "llm",
-                    "response": llm_response.model_dump(mode="json"),
+                    "response": llm_response_payload,
                 },
+                final_answer=llm_text or None,
                 metadata={
                     "guardrails_decision": "allow",
                     "llm_completion_enforced": True,
@@ -957,20 +972,17 @@ class ConversationService:
         intermediate_observations: list[dict[str, object]],
         route_decision: AutoActionDecision,
     ) -> RoundResponse:
-        prepared_snapshot = self._prepare_snapshot_for_round_response(
-            snapshot=snapshot,
-            goal=record.goal,
-            round_id=record.round_id,
-        )
+        prepared_snapshot = snapshot
         request_id, trace_id = build_request_identifiers(
             request_prefix=self._options.request_prefix,
             trace_prefix=self._options.trace_prefix,
             action_type=str(observation.get("source", route_decision.action_type)),
         )
+        observation_text = _extract_observation_text(observation=observation)
         self._stm.replace_context_snapshot(snapshot=prepared_snapshot)
         snapshot = self._stm.apply_writeback(
             record=prepare_writeback_record(
-                stage="post_action",
+                stage="post_answer",
                 execution_context=ExecutionContext(
                     request_id=request_id,
                     session_id=self.session_id,
@@ -978,9 +990,10 @@ class ConversationService:
                     trace_id=f"{trace_id}.pending",
                     source="react",
                 ),
-                react_status=ReactStatus.RUNNING,
+                react_status=ReactStatus.FINISHED,
                 current_step=None,
                 observation=observation,
+                final_answer=observation_text,
                 metadata={
                     "guardrails_decision": "allow",
                     "llm_completion_enforced": False,
@@ -1021,18 +1034,6 @@ class ConversationService:
                 ),
             },
         )
-
-    def _prepare_snapshot_for_round_response(
-        self,
-        *,
-        snapshot: ContextSnapshot,
-        goal: str,
-        round_id: str,
-    ) -> ContextSnapshot:
-        perception = dict(snapshot.perception)
-        perception["pending_user_message"] = goal
-        perception["pending_round_id"] = round_id
-        return snapshot.model_copy(update={"perception": perception})
 
     def _decide_auto_action(
         self,
@@ -1284,7 +1285,7 @@ def derive_result_text_from_snapshot(*, snapshot: ContextSnapshot) -> str | None
     history = read_conversation_history(snapshot=snapshot)
     if history:
         return history[-1].content
-    return None
+    return _extract_observation_text(observation=snapshot.last_observation or {})
 
 
 def build_session_status(
@@ -1300,11 +1301,21 @@ def build_session_status(
     clarify_reason = snapshot.perception.get("clarify_reason")
     if not isinstance(clarify_reason, str):
         clarify_reason = None
+    pending_external_interaction = snapshot.perception.get("pending_external_interaction")
+    has_pending_external_interaction = isinstance(pending_external_interaction, dict)
+    if clarify_reason is None and has_pending_external_interaction:
+        pending_prompt = pending_external_interaction.get("prompt")
+        if isinstance(pending_prompt, str) and pending_prompt.strip():
+            clarify_reason = pending_prompt.strip()
 
     status_key: StatusKey
     if not history and snapshot.last_observation is None:
         status_key = "idle"
-    elif result_type == "clarify" or bool(snapshot.perception.get("clarify_needed")):
+    elif (
+        result_type == "clarify"
+        or bool(snapshot.perception.get("clarify_needed"))
+        or has_pending_external_interaction
+    ):
         status_key = "needs_clarify"
     elif snapshot.stm.get("last_react_status") in {
         ReactStatus.BLOCKED.value,
@@ -1343,6 +1354,40 @@ def derive_result_profile_name(*, snapshot: ContextSnapshot) -> str | None:
             profile_name = provider_trace.get("profile_name")
             if isinstance(profile_name, str) and profile_name:
                 return profile_name
+    return None
+
+
+def _extract_observation_text(*, observation: dict[str, object]) -> str | None:
+    source = observation.get("source")
+    if source == "answer":
+        output_text = observation.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+    if source == "llm":
+        response = observation.get("response")
+        if isinstance(response, dict):
+            text = extract_text_from_llm_response(response=response).strip()
+            if text:
+                return text
+
+    if source in {"tool", "mcp"}:
+        result = observation.get("result")
+        if isinstance(result, dict):
+            text = result.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+    if source in {"rag", "skill"}:
+        result = observation.get("result")
+        if result is not None:
+            return json.dumps(result, ensure_ascii=False)
+
+    error = observation.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
     return None
 
 

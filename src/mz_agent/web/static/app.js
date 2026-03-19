@@ -117,6 +117,14 @@ let profileState = {
 let isLoading = false;
 let activeAgentStream = null;
 let markdownReady = false;
+let currentStatusLabel = "待输入";
+let renderedHistory = [];
+let latestRenderedHistoryMeta = {
+  length: 0,
+  lastRole: "",
+  lastContent: "",
+  lastRoundId: "",
+};
 
 const markdownRoles = new Set(["assistant", "user"]);
 const apiModeLabels = {
@@ -193,6 +201,43 @@ function safeParseJson(raw) {
   }
 }
 
+function buildHistoryMeta(history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return {
+      length: 0,
+      lastRole: "",
+      lastContent: "",
+      lastRoundId: "",
+    };
+  }
+  const lastItem = history[history.length - 1] || {};
+  return {
+    length: history.length,
+    lastRole: typeof lastItem.role === "string" ? lastItem.role : "",
+    lastContent: typeof lastItem.content === "string" ? lastItem.content : "",
+    lastRoundId: typeof lastItem.round_id === "string" ? lastItem.round_id : "",
+  };
+}
+
+function shouldRenderHistory(nextMeta, force = false) {
+  if (force) return true;
+  if (nextMeta.length < latestRenderedHistoryMeta.length) {
+    return false;
+  }
+  if (
+    nextMeta.length === latestRenderedHistoryMeta.length &&
+    latestRenderedHistoryMeta.length > 0 &&
+    (
+      nextMeta.lastRoundId !== latestRenderedHistoryMeta.lastRoundId ||
+      nextMeta.lastContent !== latestRenderedHistoryMeta.lastContent ||
+      nextMeta.lastRole !== latestRenderedHistoryMeta.lastRole
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function configureMarkdown() {
   if (markdownReady || !window.marked) return;
 
@@ -230,7 +275,7 @@ function closeAgentStream() {
   }
 }
 
-async function loadSessionSnapshotFromStream() {
+async function loadSessionSnapshotFromStream(forceRender = false) {
   if (typeof window.EventSource !== "function") {
     throw new Error("当前浏览器不支持事件流。");
   }
@@ -269,7 +314,7 @@ async function loadSessionSnapshotFromStream() {
       const payload = safeParseJson(event.data);
       if (!payload) return;
       latestHistory = payload;
-      renderChatFlow(payload.history || []);
+      renderChatFlow(payload.history || [], { force: forceRender });
     });
 
     source.addEventListener("stream_end", () => {
@@ -283,16 +328,16 @@ async function loadSessionSnapshotFromStream() {
   });
 }
 
-async function loadSessionSnapshot() {
+async function loadSessionSnapshot(forceRender = false) {
   try {
-    return await loadSessionSnapshotFromStream();
+    return await loadSessionSnapshotFromStream(forceRender);
   } catch {
     const [status, history] = await Promise.all([
       api(`/api/session/${sessionId}/status`),
       api(`/api/session/${sessionId}/history`),
     ]);
     updateStatusDot(status.status_label);
-    renderChatFlow(history.history || []);
+    renderChatFlow(history.history || [], { force: forceRender });
     return { status, history };
   }
 }
@@ -328,8 +373,9 @@ function setLoading(loading) {
 
 /* ---------- 状态点 ---------- */
 function updateStatusDot(statusLabel) {
+  currentStatusLabel = statusLabel || "待输入";
   el.statusDot.className = "status-dot";
-  el.statusDot.title = statusLabel || "待输入";
+  el.statusDot.title = currentStatusLabel;
   if (!statusLabel || statusLabel === "待输入") {
     el.statusDot.classList.add("idle");
   } else if (statusLabel.includes("处理") || statusLabel.includes("运行")) {
@@ -458,7 +504,7 @@ function bindMessageActions(messageEl, item) {
           method: "POST",
         });
         updateStatusDot(payload.status?.status_label);
-        renderChatFlow(payload.history || []);
+        renderChatFlow(payload.history || [], { force: true });
         showToast("已重新执行该轮次", "success");
       } catch (err) {
         showToast(err.message, "error");
@@ -510,7 +556,16 @@ function createMessageEl(item, index) {
   return div;
 }
 
-function renderChatFlow(history) {
+function renderChatFlow(history, options = {}) {
+  const force = options.force === true;
+  const nextMeta = buildHistoryMeta(history);
+  if (!shouldRenderHistory(nextMeta, force)) {
+    return;
+  }
+  renderedHistory = Array.isArray(history)
+    ? history.map((item) => ({ ...item }))
+    : [];
+  latestRenderedHistoryMeta = nextMeta;
   const children = Array.from(el.chatFlow.children);
   children.forEach((child) => {
     if (child !== el.chatEmpty) child.remove();
@@ -532,11 +587,23 @@ function renderChatFlow(history) {
 }
 
 function appendMessage(item, index) {
+  renderedHistory.push({ ...item });
+  latestRenderedHistoryMeta = buildHistoryMeta(renderedHistory);
   el.chatEmpty.classList.add("hidden");
   el.chatFlow.appendChild(createMessageEl(item, index));
   requestAnimationFrame(() => {
     el.chatScroll.scrollTop = el.chatScroll.scrollHeight;
   });
+}
+
+function buildOptimisticUserHistory(goal) {
+  const history = renderedHistory.map((item) => ({ ...item }));
+  history.push({
+    role: "user",
+    content: goal,
+    local_pending: true,
+  });
+  return history;
 }
 
 /* ---------- 连接与模型渲染 ---------- */
@@ -1051,16 +1118,24 @@ el.roundForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (!validateForm()) return;
 
+  const draftGoal = el.goal.value;
+  const goal = draftGoal.trim();
   const actionType = resolveActionType();
   const enabledCaps = getEnabledCapabilities();
+  const previousHistory = renderedHistory.map((item) => ({ ...item }));
+  const previousStatusLabel = currentStatusLabel;
 
+  renderChatFlow(buildOptimisticUserHistory(goal), { force: true });
+  el.goal.value = "";
+  autoResizeTextarea();
+  updateStatusDot("处理中");
   setLoading(true);
   try {
     const payload = await api("/api/round", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        goal: el.goal.value.trim(),
+        goal,
         action_type: actionType,
         target: null,
         profile_name: profileState.activeProfileName,
@@ -1077,12 +1152,12 @@ el.roundForm.addEventListener("submit", async (e) => {
     });
 
     updateStatusDot(payload.status?.status_label);
-    renderChatFlow(payload.history || []);
-    if (payload.result_type !== "clarify") {
-      el.goal.value = "";
-      autoResizeTextarea();
-    }
+    renderChatFlow(payload.history || [], { force: true });
   } catch (err) {
+    renderChatFlow(previousHistory, { force: true });
+    updateStatusDot(previousStatusLabel);
+    el.goal.value = draftGoal;
+    autoResizeTextarea();
     showToast(err.message, "error");
   } finally {
     setLoading(false);
@@ -1092,7 +1167,13 @@ el.roundForm.addEventListener("submit", async (e) => {
 /* 刷新 */
 el.refreshStatus.addEventListener("click", async () => {
   setLoading(true);
-  try { await refreshAll(); showToast("已刷新", "success"); }
+  try {
+    await loadSessionSnapshot(true);
+    const profiles = await api("/api/llm/profiles");
+    await refreshCapabilities();
+    renderProfileSelectors(profiles);
+    showToast("已刷新", "success");
+  }
   catch (err) { showToast(err.message, "error"); }
   finally { setLoading(false); }
 });
@@ -1104,7 +1185,7 @@ el.resetSession.addEventListener("click", async () => {
   try {
     const payload = await api(`/api/session/${sessionId}/reset`, { method: "POST" });
     updateStatusDot(payload.status?.status_label);
-    renderChatFlow([]);
+    renderChatFlow([], { force: true });
     showToast(payload.message || "会话已重置", "success");
   } catch (err) { showToast(err.message, "error"); }
   finally { setLoading(false); }

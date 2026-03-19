@@ -120,9 +120,20 @@ def test_web_round_accepts_auto_mode_capability_payload(tmp_path: Path) -> None:
     assert round_response["json"]["round_id"].startswith("round_")
     assert round_response["json"]["result_type"] == "llm"
     assert round_response["json"]["result_text"] == "已基于搜索结果生成最终答复"
-    assert round_response["json"]["history"][0]["round_id"] == round_response["json"]["round_id"]
-    assert round_response["json"]["history"][1]["round_id"] == round_response["json"]["round_id"]
+    assert round_response["json"]["status"]["status_key"] == "completed"
     assert len(round_response["json"]["history"]) == 2
+    assert round_response["json"]["history"] == [
+        {
+            "role": "user",
+            "content": "搜索协议",
+            "round_id": round_response["json"]["round_id"],
+        },
+        {
+            "role": "assistant",
+            "content": "已基于搜索结果生成最终答复",
+            "round_id": round_response["json"]["round_id"],
+        },
+    ]
     assert round_response["json"]["raw_result"]["llm_completion_enforced"] is True
     sources = [
         item["source"]
@@ -283,7 +294,21 @@ def test_web_auto_round_explicit_routed_mcp_runs_and_waits_for_followup(tmp_path
     assert first_round["status"] == 200
     assert first_round["json"]["result_type"] == "mcp"
     assert first_round["json"]["result_text"] == "你当前最担心什么？"
+    assert first_round["json"]["status"]["status_key"] == "needs_clarify"
+    assert first_round["json"]["status"]["clarify_reason"] == "你当前最担心什么？"
     assert first_round["json"]["raw_result"]["pending_external_interaction"]["target"] == "cunzhi:zhi"
+    assert first_round["json"]["history"] == [
+        {
+            "role": "user",
+            "content": "请用外部提问能力向我提一个问题",
+            "round_id": first_round["json"]["round_id"],
+        },
+        {
+            "role": "assistant",
+            "content": "你当前最担心什么？",
+            "round_id": first_round["json"]["round_id"],
+        },
+    ]
 
     second_round = call_app(
         app,
@@ -306,12 +331,100 @@ def test_web_auto_round_explicit_routed_mcp_runs_and_waits_for_followup(tmp_path
     assert second_round["json"]["result_type"] == "llm"
     assert second_round["json"]["result_text"] == "我已收到你的回答，当前最关键的问题是编排链断裂。"
     assert len(second_round["json"]["history"]) == 4
-    assert second_round["json"]["history"][-2]["content"] == "我最担心编排链断裂"
-    assert second_round["json"]["history"][-1]["content"] == "我已收到你的回答，当前最关键的问题是编排链断裂。"
+    assert second_round["json"]["history"][-2] == {
+        "role": "user",
+        "content": "我最担心编排链断裂",
+        "round_id": second_round["json"]["round_id"],
+    }
+    assert second_round["json"]["history"][-1] == {
+        "role": "assistant",
+        "content": "我已收到你的回答，当前最关键的问题是编排链断裂。",
+        "round_id": second_round["json"]["round_id"],
+    }
     completion_request = responder.requests[-1]
     completion_texts = [message.content for message in completion_request.messages]
-    assert "你当前最担心什么？" in completion_texts
-    assert "我最担心编排链断裂" in completion_texts
+    assert completion_texts[-3:] == [
+        "你当前最担心什么？",
+        "我最担心编排链断裂",
+        "我最担心编排链断裂",
+    ]
+
+
+def test_web_auto_round_explicit_routed_mcp_can_keep_followup_and_still_finish_with_llm(
+    tmp_path: Path,
+) -> None:
+    responder = ScriptedLLMResponder(
+        route_map={
+            "请先向我提问再总结当前风险": {
+                "action_type": "mcp",
+                "target": "cunzhi:zhi",
+                "arguments": {"message": "你当前最担心什么？", "is_markdown": True},
+                "respond_with_llm": True,
+                "expect_user_followup": True,
+                "reason": "先向用户追问，同时给出本轮总结。",
+            }
+        },
+        completion_map={"请先向我提问再总结当前风险": "我先向你追问一个关键问题：你当前最担心什么？"},
+    )
+    app = _build_test_app_with_profile_and_llm(
+        tmp_path,
+        responder=responder,
+    )
+
+    service = app._service  # type: ignore[attr-defined]
+    service._pipeline.adapters.mcp.register(
+        binding=MCPBinding(
+            server_name="cunzhi",
+            transport="stdio",
+            tool_name="zhi",
+            namespace="cunzhi",
+        ),
+        handler=lambda message, is_markdown=True: ToolExecutionResult(
+            status="success",
+            text="你当前最担心什么？",
+            data={"received_message": message, "is_markdown": is_markdown},
+        ),
+    )
+
+    round_response = call_app(
+        app,
+        method="POST",
+        path="/api/round",
+        payload={
+            "goal": "请先向我提问再总结当前风险",
+            "action_type": "auto",
+            "target": None,
+            "profile_name": "default",
+            "enabled_capabilities": ["mcp"],
+            "enabled_tools": [],
+            "enabled_mcp": ["cunzhi:zhi"],
+            "enabled_skills": [],
+            "rag_enabled": False,
+        },
+    )
+
+    assert round_response["status"] == 200
+    assert round_response["json"]["result_type"] == "llm"
+    assert round_response["json"]["result_text"] == "我先向你追问一个关键问题：你当前最担心什么？"
+    assert round_response["json"]["status"]["status_key"] == "needs_clarify"
+    assert round_response["json"]["status"]["clarify_reason"] == "你当前最担心什么？"
+    assert round_response["json"]["raw_result"]["llm_completion_enforced"] is True
+    assert round_response["json"]["raw_result"]["pending_external_interaction"]["target"] == "cunzhi:zhi"
+    assert round_response["json"]["history"] == [
+        {
+            "role": "user",
+            "content": "请先向我提问再总结当前风险",
+            "round_id": round_response["json"]["round_id"],
+        },
+        {
+            "role": "assistant",
+            "content": "我先向你追问一个关键问题：你当前最担心什么？",
+            "round_id": round_response["json"]["round_id"],
+        },
+    ]
+    completion_request = responder.requests[-1]
+    assert "你当前最担心什么？" in completion_request.messages[0].content
+    assert completion_request.messages[-1].content == "请先向我提问再总结当前风险"
 
 
 def test_web_auto_round_explicit_routed_mcp_error_does_not_block_later_llm_response(tmp_path: Path) -> None:
